@@ -1307,6 +1307,10 @@ dri_query_dma_buf_modifiers(struct dri_screen *screen, int fourcc, int max,
 
    format = map->pipe_format;
 
+   if (pscreen->is_dmabuf_format_supported &&
+       !pscreen->is_dmabuf_format_supported(pscreen, format))
+      return false;
+
    bool native_sampling = pscreen->is_format_supported(pscreen, format, screen->target, 0, 0,
                                                        PIPE_BIND_SAMPLER_VIEW) ||
                           pscreen->is_format_supported(pscreen, format, screen->target, 0, 0,

@@ -208,6 +208,9 @@ d3d12_bo_unreference(struct d3d12_bo *bo)
       mtx_unlock(&bo->screen->submit_mutex);
 
       d3d12_resource_state_cleanup(&bo->global_state);
+#ifdef HAVE_ASB_DRM
+      asb_drm_buffer_destroy(bo->asb_buffer);
+#endif
       if (bo->res)
          bo->res->Release();
 

@@ -536,6 +536,9 @@ struct pipe_screen {
                                   uint64_t *modifiers,
                                   unsigned int *external_only, int *count);
 
+   bool (*is_dmabuf_format_supported)(struct pipe_screen *screen,
+                                     enum pipe_format format);
+
    /**
     * Create a memory object from a winsys handle
     *

@@ -149,6 +149,11 @@ if is_xbox == false
 endif
 
 libd3d12_deps = [dep_dxheaders, idep_mesautil]
+if host_machine.system() == 'linux' and dep_libdrm.found()
+  files_libd3d12 += files('asb_drm_bridge.c')
+  libd3d12_compiler_args += '-DHAVE_ASB_DRM'
+  libd3d12_deps += dep_libdrm
+endif
 if with_gallium_d3d12_graphics
   libd3d12_deps += [idep_nir_headers, idep_libdxil_compiler]
 endif

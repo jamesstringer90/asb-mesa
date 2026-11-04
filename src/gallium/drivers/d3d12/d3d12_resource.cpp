@@ -41,6 +41,11 @@
 #include <dxguids/dxguids.h>
 #include <memory>
 
+#ifdef HAVE_ASB_DRM
+#include <drm_fourcc.h>
+#include <unistd.h>
+#endif
+
 #ifndef _GAMING_XBOX
 #include <wrl/client.h>
 using Microsoft::WRL::ComPtr;
@@ -204,6 +209,48 @@ init_buffer(struct d3d12_screen *screen,
    return true;
 }
 
+#ifdef HAVE_ASB_DRM
+static uint32_t
+d3d12_asb_format(enum pipe_format format)
+{
+   switch (util_format_linear(format)) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+      return DRM_FORMAT_ARGB8888;
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+      return DRM_FORMAT_XRGB8888;
+   default:
+      return 0;
+   }
+}
+
+static bool
+d3d12_asb_export_buffer(struct d3d12_screen *screen,
+                        struct d3d12_resource *res)
+{
+   if (res->bo->asb_buffer)
+      return true;
+   struct pipe_resource *pres = &res->base.b;
+   uint32_t format = d3d12_asb_format(pres->format);
+   if (!format || pres->last_level || pres->array_size != 1 ||
+       pres->nr_samples > 1 ||
+       (pres->target != PIPE_TEXTURE_2D && pres->target != PIPE_TEXTURE_RECT))
+      return false;
+   HANDLE shared = nullptr;
+   if (FAILED(screen->dev->CreateSharedHandle(res->bo->res, nullptr,
+                                             GENERIC_ALL, nullptr, &shared)))
+      return false;
+   struct asb_drm_image image = {};
+   image.fd = (int)(intptr_t)shared;
+   image.width = pres->width0;
+   image.height = pres->height0;
+   image.format = format;
+   image.pitch = pres->width0 * 4;
+   res->bo->asb_buffer = asb_drm_buffer_create(screen->asb_bridge, &image);
+   close(image.fd);
+   return res->bo->asb_buffer != nullptr;
+}
+#endif
+
 static bool
 init_texture(struct d3d12_screen *screen,
              struct d3d12_resource *res,
@@ -212,6 +259,19 @@ init_texture(struct d3d12_screen *screen,
              uint64_t placed_offset)
 {
    ID3D12Resource *d3d12_res;
+   bool asb_shared = false;
+#ifdef HAVE_ASB_DRM
+   asb_shared = screen->asb_bridge &&
+      (templ->bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET));
+   if (asb_shared) {
+      if (heap || !d3d12_asb_format(templ->format) || templ->last_level ||
+          templ->array_size != 1 || templ->nr_samples > 1 ||
+          (templ->bind & PIPE_BIND_LINEAR) ||
+          (templ->target != PIPE_TEXTURE_2D && templ->target != PIPE_TEXTURE_RECT))
+         return false;
+      res->base.b.bind |= PIPE_BIND_SHARED;
+   }
+#endif
 
    res->mip_levels = templ->last_level + 1;
    res->dxgi_format = d3d12_get_format(templ->format);
@@ -266,7 +326,7 @@ init_texture(struct d3d12_screen *screen,
       desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
    // This is expected from D3D11 openers for D3D12 created shareable resources
-   if (templ->bind & PIPE_BIND_SHARED)
+   if (asb_shared || (templ->bind & PIPE_BIND_SHARED))
       desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
 
    if (templ->bind & PIPE_BIND_DEPTH_STENCIL) {
@@ -319,7 +379,7 @@ init_texture(struct d3d12_screen *screen,
       }
    }
 
-   if (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_LINEAR))
+   if (!asb_shared && (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_LINEAR)))
       desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
    HRESULT hres = E_FAIL;
@@ -373,6 +433,11 @@ init_texture(struct d3d12_screen *screen,
          if (templ->bind & PIPE_BIND_SHARED)
             heap_flags |= D3D12_HEAP_FLAG_SHARED;
 
+         if (asb_shared) {
+            heap_flags = D3D12_HEAP_FLAG_SHARED;
+            init_residency = d3d12_permanently_resident;
+         }
+
          hres = screen->dev10->CreateCommittedResource3(&heap_pris,
                                                         heap_flags,
                                                         &desc1,
@@ -404,6 +469,11 @@ init_texture(struct d3d12_screen *screen,
          if (templ->bind & PIPE_BIND_SHARED)
             heap_flags |= D3D12_HEAP_FLAG_SHARED;
 
+         if (asb_shared) {
+            heap_flags = D3D12_HEAP_FLAG_SHARED;
+            init_residency = d3d12_permanently_resident;
+         }
+
          hres = screen->dev->CreateCommittedResource(&heap_pris,
                                                      heap_flags,
                                                      &desc,
@@ -417,7 +487,7 @@ init_texture(struct d3d12_screen *screen,
    if (FAILED(hres))
       return false;
 
-   if (screen->winsys && (templ->bind & PIPE_BIND_DISPLAY_TARGET)) {
+   if (!asb_shared && screen->winsys && (templ->bind & PIPE_BIND_DISPLAY_TARGET)) {
       struct sw_winsys *winsys = screen->winsys;
       if (winsys->is_displaytarget_format_supported(winsys, res->base.b.bind, res->base.b.format)) {
          res->dt = winsys->displaytarget_create(screen->winsys,
@@ -440,6 +510,18 @@ init_texture(struct d3d12_screen *screen,
    }
 
    res->bo = d3d12_bo_wrap_res(screen, d3d12_res, init_residency);
+
+   if (!res->bo) {
+      d3d12_res->Release();
+      return false;
+   }
+#ifdef HAVE_ASB_DRM
+   if (asb_shared && !d3d12_asb_export_buffer(screen, res)) {
+      d3d12_bo_unreference(res->bo);
+      res->bo = nullptr;
+      return false;
+   }
+#endif
 
    return true;
 }
@@ -581,6 +663,22 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    HANDLE d3d_handle = (HANDLE) (intptr_t) handle->handle;
 #endif
 
+#ifdef HAVE_ASB_DRM
+   struct asb_drm_image asb_image = {};
+   asb_image.fd = -1;
+   if (screen->asb_bridge && handle->type == WINSYS_HANDLE_TYPE_FD) {
+      if (handle->offset || handle->plane ||
+          handle->modifier != DRM_FORMAT_MOD_INVALID || (templ && templ->next) ||
+          !asb_drm_import_image(screen->asb_bridge, handle->handle, &asb_image)) {
+         if (res->bo)
+            d3d12_bo_unreference(res->bo);
+         FREE(res);
+         return nullptr;
+      }
+      d3d_handle = (HANDLE)(intptr_t)asb_image.fd;
+   }
+#endif
+
 #ifndef _GAMING_XBOX
    if (handle->type == WINSYS_HANDLE_TYPE_D3D12_RES) {
       ComPtr<IUnknown> screen_device;
@@ -641,6 +739,11 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
       screen->dev->OpenSharedHandle(d3d_handle, IID_PPV_ARGS(&d3d12_res));
    }
 
+#ifdef HAVE_ASB_DRM
+   if (asb_image.fd >= 0)
+      close(asb_image.fd);
+#endif
+
 #ifdef _WIN32
    if (d3d_handle_to_close) {
       CloseHandle(d3d_handle_to_close);
@@ -664,6 +767,15 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    pipe_reference_init(&res->base.b.reference, 1);
    res->base.b.screen = pscreen;
    incoming_res_desc = GetDesc(d3d12_res);
+
+#ifdef HAVE_ASB_DRM
+   if (asb_image.fd >= 0 &&
+       (incoming_res_desc.Width != asb_image.width ||
+        incoming_res_desc.Height != asb_image.height ||
+        (handle->stride && handle->stride != asb_image.pitch) ||
+        asb_image.format != d3d12_asb_format((enum pipe_format)handle->format)))
+      goto invalid;
+#endif
 
    /* Get a description for this plane */
    if (templ && handle->format != templ->format) {
@@ -820,6 +932,12 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    if (!res->bo) {
       res->bo = d3d12_bo_wrap_res(screen, d3d12_res, d3d12_permanently_resident);
    }
+   if (!res->bo)
+      goto invalid;
+#ifdef HAVE_ASB_DRM
+   if (asb_image.fd >= 0 && !d3d12_asb_export_buffer(screen, res))
+      goto invalid;
+#endif
    init_valid_range(res);
 
    threaded_resource_init(&res->base.b, false);
@@ -845,6 +963,27 @@ d3d12_resource_get_handle(struct pipe_screen *pscreen,
 {
    struct d3d12_resource *res = d3d12_resource(pres);
    struct d3d12_screen *screen = d3d12_screen(pscreen);
+
+#ifdef HAVE_ASB_DRM
+   if (screen->asb_bridge &&
+       (handle->type == WINSYS_HANDLE_TYPE_KMS || handle->type == WINSYS_HANDLE_TYPE_FD)) {
+      if (!res->bo || !res->bo->asb_buffer || handle->plane || handle->layer)
+         return false;
+      if (handle->type == WINSYS_HANDLE_TYPE_KMS) {
+         handle->handle = asb_drm_buffer_handle(res->bo->asb_buffer);
+      } else {
+         int fd = asb_drm_buffer_fd(res->bo->asb_buffer);
+         if (fd < 0)
+            return false;
+         handle->handle = fd;
+      }
+      handle->stride = pres->width0 * 4;
+      handle->offset = 0;
+      handle->format = pres->format;
+      handle->modifier = DRM_FORMAT_MOD_INVALID;
+      return true;
+   }
+#endif
 
    switch (handle->type) {
    case WINSYS_HANDLE_TYPE_D3D12_RES:

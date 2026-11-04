@@ -39,6 +39,10 @@
 
 #include "d3d12_common.h"
 
+#ifdef HAVE_ASB_DRM
+#include "asb_drm_bridge.h"
+#endif
+
 struct pb_manager;
 struct util_dl_library;
 
@@ -70,6 +74,8 @@ struct d3d12_memory_info {
 struct d3d12_screen {
    struct pipe_screen base;
    struct sw_winsys *winsys;
+   struct asb_drm_bridge *asb_bridge;
+   uint32_t asb_sync_failed;
    LUID adapter_luid;
    char driver_uuid[PIPE_UUID_SIZE];
    char device_uuid[PIPE_UUID_SIZE];

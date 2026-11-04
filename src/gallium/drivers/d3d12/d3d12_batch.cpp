@@ -37,6 +37,47 @@
 
 #include <dxguids/dxguids.h>
 
+#ifdef HAVE_ASB_DRM
+#include <unistd.h>
+
+struct d3d12_asb_sync {
+   struct d3d12_screen *screen;
+   struct d3d12_batch *batch;
+   int fd;
+   bool has_buffers;
+};
+
+static bool
+d3d12_asb_sync_bo(struct d3d12_asb_sync *sync, struct d3d12_bo *bo,
+                  uint8_t state)
+{
+   if (!bo->asb_buffer)
+      return true;
+   sync->has_buffers = true;
+   bool write = (state & batch_bo_reference_written) != 0;
+   if (sync->fd < 0)
+      return asb_drm_buffer_wait(bo->asb_buffer, write);
+   return asb_drm_buffer_set_fence(bo->asb_buffer, sync->fd, write);
+}
+
+static bool
+d3d12_asb_sync_batch(struct d3d12_asb_sync *sync)
+{
+   struct d3d12_batch *batch = sync->batch;
+   util_dynarray_foreach(&batch->local_bos, struct d3d12_bo *, bo) {
+      uint8_t state = (*bo)->local_reference_state[batch->ctx_id][batch->ctx_index];
+      if (!d3d12_asb_sync_bo(sync, *bo, state))
+         return false;
+   }
+   hash_table_foreach(batch->bos, entry) {
+      struct d3d12_bo *bo = (struct d3d12_bo *)entry->key;
+      if (!d3d12_asb_sync_bo(sync, bo, *(uint8_t *)&entry->data))
+         return false;
+   }
+   return true;
+}
+#endif
+
 
 unsigned d3d12_sampler_desc_table_key_hash(const void* key)
 {
@@ -315,22 +356,62 @@ d3d12_end_batch(struct d3d12_context *ctx, struct d3d12_batch *batch)
 
    mtx_lock(&screen->submit_mutex);
 
-#ifndef _GAMING_XBOX
-   d3d12_process_batch_residency(screen, batch);
+   bool submit = true;
+#ifdef HAVE_ASB_DRM
+   if (screen->asb_bridge) {
+      if (!p_atomic_read(&screen->asb_sync_failed))
+         batch->fence = d3d12_create_fence_raw(screen->fence, screen->fence_value + 1);
+      if (!batch->fence) {
+         batch->has_errors = true;
+         p_atomic_set(&screen->asb_sync_failed, 1);
+         mtx_unlock(&screen->submit_mutex);
+         return;
+      }
+      struct d3d12_asb_sync sync = {screen, batch, -1, false};
+      submit = d3d12_asb_sync_batch(&sync);
+      if (submit && sync.has_buffers) {
+         sync.fd = asb_drm_export_fence(screen->asb_bridge, batch->fence->value);
+         submit = sync.fd >= 0;
+         if (submit) {
+            submit = d3d12_asb_sync_batch(&sync);
+            close(sync.fd);
+         }
+      }
+      if (!submit) {
+         batch->has_errors = true;
+         p_atomic_set(&screen->asb_sync_failed, 1);
+      }
+   }
 #endif
 
-   bool has_state_fixup = d3d12_context_state_resolve_submission(ctx, batch);
+   if (submit) {
+#ifndef _GAMING_XBOX
+      d3d12_process_batch_residency(screen, batch);
+#endif
 
-   ID3D12CommandList *cmdlists[] = { ctx->state_fixup_cmdlist, ctx->cmdlist };
-   ID3D12CommandList **to_execute = cmdlists;
-   UINT count_to_execute = ARRAY_SIZE(cmdlists);
-   if (!has_state_fixup) {
-      to_execute++;
-      count_to_execute--;
+      bool has_state_fixup = d3d12_context_state_resolve_submission(ctx, batch);
+
+      ID3D12CommandList *cmdlists[] = { ctx->state_fixup_cmdlist, ctx->cmdlist };
+      ID3D12CommandList **to_execute = cmdlists;
+      UINT count_to_execute = ARRAY_SIZE(cmdlists);
+      if (!has_state_fixup) {
+         to_execute++;
+         count_to_execute--;
+      }
+      screen->cmdqueue->ExecuteCommandLists(count_to_execute, to_execute);
    }
-   screen->cmdqueue->ExecuteCommandLists(count_to_execute, to_execute);
 
-   batch->fence = d3d12_create_fence(screen, true);
+   if (batch->fence) {
+      ++screen->fence_value;
+      if (FAILED(screen->cmdqueue->Signal(screen->fence, batch->fence->value))) {
+         batch->has_errors = true;
+#ifdef HAVE_ASB_DRM
+         p_atomic_set(&screen->asb_sync_failed, 1);
+#endif
+      }
+   } else {
+      batch->fence = d3d12_create_fence(screen, true);
+   }
 
    if (batch->fence) {
       uint64_t fv = batch->fence->value;

@@ -399,6 +399,10 @@ static enum pipe_reset_status
 d3d12_get_reset_status(struct pipe_context *pctx)
 {
    struct d3d12_screen *screen = d3d12_screen(pctx->screen);
+#ifdef HAVE_ASB_DRM
+   if (p_atomic_read(&screen->asb_sync_failed))
+      return PIPE_UNKNOWN_CONTEXT_RESET;
+#endif
    HRESULT hr = screen->dev->GetDeviceRemovedReason();
    switch (hr) {
    case DXGI_ERROR_DEVICE_HUNG:

@@ -52,6 +52,7 @@ struct d3d12_bo {
    struct d3d12_screen *screen;
    ID3D12Resource *res;
    struct pb_buffer *buffer;
+   struct asb_drm_buffer *asb_buffer;
    struct d3d12_resource_state global_state;
 
    /* Used as a key in per-context resource state maps,

@@ -810,6 +810,10 @@ dri_query_dma_buf_formats(struct dri_screen *screen, int max, int *formats,
       if (dri2_format_table[i].dri_fourcc == __DRI_IMAGE_FOURCC_SARGB8888)
          continue;
 
+      if (pscreen->is_dmabuf_format_supported &&
+          !pscreen->is_dmabuf_format_supported(pscreen, map->pipe_format))
+         continue;
+
       if (pscreen->is_format_supported(pscreen, map->pipe_format,
                                        screen->target, 0, 0,
                                        PIPE_BIND_RENDER_TARGET) ||

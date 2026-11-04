@@ -23,6 +23,11 @@
 
 #include "d3d12_screen.h"
 
+#ifdef HAVE_ASB_DRM
+#include <drm.h>
+#include <unistd.h>
+#endif
+
 #include "d3d12_bufmgr.h"
 #ifdef HAVE_GALLIUM_D3D12_GRAPHICS
 #include "d3d12_compiler.h"
@@ -440,6 +445,10 @@ d3d12_init_screen_caps(struct d3d12_screen *screen)
 
    caps->max_texture_lod_bias = 15.99f;
    caps->packed_uniforms = true;
+#ifdef HAVE_ASB_DRM
+   if (screen->asb_bridge)
+      caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
+#endif
 }
 
 static bool
@@ -454,6 +463,18 @@ d3d12_is_format_supported(struct pipe_screen *pscreen,
 
    if (MAX2(1, sample_count) != MAX2(1, storage_sample_count))
       return false;
+
+#ifdef HAVE_ASB_DRM
+   if (screen->asb_bridge &&
+       (bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET))) {
+      enum pipe_format linear = util_format_linear(format);
+      if ((target != PIPE_TEXTURE_2D && target != PIPE_TEXTURE_RECT) ||
+          sample_count > 1 || (bind & PIPE_BIND_LINEAR) ||
+          (linear != PIPE_FORMAT_B8G8R8A8_UNORM &&
+           linear != PIPE_FORMAT_B8G8R8X8_UNORM))
+         return false;
+   }
+#endif
 
    if (target == PIPE_BUFFER) {
       /* Replace emulated vertex element formats for the tests */
@@ -645,6 +666,10 @@ d3d12_deinit_screen(struct d3d12_screen *screen)
       screen->bufmgr = nullptr;
    }
    d3d12_deinit_residency(screen);
+#ifdef HAVE_ASB_DRM
+   asb_drm_bridge_destroy(screen->asb_bridge);
+   screen->asb_bridge = nullptr;
+#endif
    if (screen->fence) {
       screen->fence->Release();
       screen->fence = nullptr;
@@ -688,6 +713,16 @@ d3d12_destroy_screen(struct d3d12_screen *screen)
    FREE(screen);
 }
 
+#ifdef HAVE_ASB_DRM
+static bool
+d3d12_asb_is_dmabuf_format_supported(struct pipe_screen *screen,
+                                    enum pipe_format format)
+{
+   return d3d12_is_format_supported(screen, format, PIPE_TEXTURE_2D, 0, 0,
+                                     PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHARED);
+}
+#endif
+
 static void
 d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
                         struct pipe_context *pctx,
@@ -703,6 +738,14 @@ d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
 
    if (!winsys || !pctx)
      return;
+
+#ifdef HAVE_ASB_DRM
+   if (res->bo && res->bo->asb_buffer) {
+      pctx->flush_resource(pctx, pres);
+      pctx->flush(pctx, nullptr, 0);
+      return;
+   }
+#endif
 
    assert(res->dt || res->dt_proxy);
    if (res->dt_proxy) {
@@ -1205,7 +1248,7 @@ d3d12_screen_get_fd(struct pipe_screen *pscreen)
    struct d3d12_screen *screen = d3d12_screen(pscreen);
    struct sw_winsys *winsys = screen->winsys;
 
-   if (winsys->get_fd)
+   if (winsys && winsys->get_fd)
       return winsys->get_fd(winsys);
    else
       return -1;
@@ -1750,6 +1793,23 @@ d3d12_init_screen(struct d3d12_screen *screen, IUnknown *adapter)
    if (FAILED(screen->dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&screen->fence))))
       return false;
 
+#ifdef HAVE_ASB_DRM
+   p_atomic_set(&screen->asb_sync_failed, 0);
+   int asb_fd = d3d12_screen_get_fd(&screen->base);
+   if (asb_fd >= 0) {
+      HANDLE shared_fence = nullptr;
+      if (SUCCEEDED(screen->dev->CreateSharedHandle(screen->fence, nullptr,
+                                                   GENERIC_ALL, nullptr,
+                                                   &shared_fence))) {
+         uint64_t luid = (uint64_t)(uint32_t)screen->adapter_luid.HighPart << 32 |
+                         screen->adapter_luid.LowPart;
+         int fence_fd = (int)(intptr_t)shared_fence;
+         screen->asb_bridge = asb_drm_bridge_create(asb_fd, luid, fence_fd);
+         close(fence_fd);
+      }
+   }
+#endif
+
    screen->dev->QueryInterface(&screen->dev15);
 
    // Uses screen->dev15 so QI must be before this
@@ -1870,6 +1930,13 @@ d3d12_init_screen(struct d3d12_screen *screen, IUnknown *adapter)
    d3d12_init_shader_caps(screen);
    d3d12_init_compute_caps(screen);
    d3d12_init_screen_caps(screen);
+
+#ifdef HAVE_ASB_DRM
+   screen->base.is_dmabuf_format_supported = nullptr;
+   if (screen->asb_bridge) {
+      screen->base.is_dmabuf_format_supported = d3d12_asb_is_dmabuf_format_supported;
+   }
+#endif
 
    return true;
 }
