@@ -150,7 +150,7 @@ endif
 
 libd3d12_deps = [dep_dxheaders, idep_mesautil]
 if host_machine.system() == 'linux' and dep_libdrm.found()
-  files_libd3d12 += files('asb_drm_bridge.c')
+  files_libd3d12 += files('../../../microsoft/common/asb_drm_bridge.c')
   libd3d12_compiler_args += '-DHAVE_ASB_DRM'
   libd3d12_deps += dep_libdrm
 endif
@@ -162,7 +162,8 @@ libd3d12 = static_library(
   'd3d12',
   [files_libd3d12, sha1_h],
   gnu_symbol_visibility : 'hidden',
-  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux],
+  include_directories : [inc_include, inc_src, inc_gallium, inc_gallium_aux,
+                         include_directories('../../../microsoft/common')],
   dependencies: libd3d12_deps,
   c_args: libd3d12_compiler_args,
   cpp_args: libd3d12_compiler_args,
@@ -170,5 +171,5 @@ libd3d12 = static_library(
 
 driver_d3d12 = declare_dependency(
   compile_args : '-DGALLIUM_D3D12',
-  link_with : [libd3d12],
+  link_with : [libd3d12, libswkmsdri],
 )

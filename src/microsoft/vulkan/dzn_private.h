@@ -56,6 +56,10 @@
 #include "dzn_nir.h"
 #include "dzn_physical_device_enum.h"
 
+#ifdef HAVE_ASB_DRM
+#include "asb_drm_bridge.h"
+#endif
+
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_icd.h>
 
@@ -198,6 +202,11 @@ struct dzn_physical_device {
 
    struct wsi_device wsi_device;
 
+#ifdef HAVE_ASB_DRM
+   int asb_render_fd;
+   dev_t asb_render_device;
+#endif
+
    ID3D12Device4 *dev;
    ID3D12Device10 *dev10;
    ID3D12Device11 *dev11;
@@ -226,6 +235,15 @@ struct dzn_physical_device {
    float timestamp_period;
    bool support_a4b4g4r4;
 };
+
+#ifdef HAVE_ASB_DRM
+static inline uint64_t
+dzn_asb_adapter_luid(const struct dzn_physical_device *pdev)
+{
+   return ((uint64_t)(uint32_t)pdev->desc.adapter_luid.HighPart << 32) |
+          pdev->desc.adapter_luid.LowPart;
+}
+#endif
 
 D3D12_FEATURE_DATA_FORMAT_SUPPORT
 dzn_physical_device_get_format_support(struct dzn_physical_device *pdev,
@@ -258,6 +276,9 @@ struct dzn_queue {
    ID3D12CommandQueue *cmdqueue;
    ID3D12Fence *fence;
    uint64_t fence_point;
+#ifdef HAVE_ASB_DRM
+   struct asb_drm_bridge *asb_bridge;
+#endif
 };
 
 struct dzn_descriptor_heap {
@@ -310,6 +331,10 @@ struct dzn_device {
    bool bindless;
    bool support_static_samplers;
    struct dzn_device_descriptor_heap device_heaps[NUM_POOL_TYPES];
+#ifdef HAVE_ASB_DRM
+   struct asb_drm_bridge *asb_bridge;
+   ID3D12Fence *asb_fence;
+#endif
 };
 
 void dzn_meta_finish(struct dzn_device *device);
@@ -345,6 +370,10 @@ struct dzn_device_memory {
 
    /* If the resource is exportable, this is the pre-created handle for that */
    HANDLE export_handle;
+
+#ifdef HAVE_ASB_DRM
+   struct asb_drm_buffer *asb_buffer;
+#endif
 
    /* These flags need to be added into all resources created on this heap */
    D3D12_RESOURCE_FLAGS res_flags;
@@ -1058,6 +1087,9 @@ struct dzn_image {
    } linear;
    D3D12_RESOURCE_DESC desc;
    ID3D12Resource *res;
+#ifdef HAVE_ASB_DRM
+   uint32_t asb_pitch;
+#endif
    uint32_t castable_format_count;
    const DXGI_FORMAT *castable_formats;
 

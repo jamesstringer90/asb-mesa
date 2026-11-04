@@ -2891,6 +2891,18 @@ wsi_common_queue_present(const struct wsi_device *wsi,
                             1, &swapchain->fences[image_index], true, ~0ull);
       }
 
+      if (wsi->prepare_present) {
+         struct vk_queue *present_queue =
+            swapchain->blit.type != WSI_SWAPCHAIN_NO_BLIT && swapchain->blit.queue ?
+            swapchain->blit.queue : queue;
+         VkDeviceMemory present_memory =
+            swapchain->blit.type == WSI_SWAPCHAIN_BUFFER_BLIT ?
+            image->blit.memory : image->memory;
+         results[i] = wsi->prepare_present(present_queue, present_memory);
+         if (results[i] != VK_SUCCESS)
+            continue;
+      }
+
       const VkPresentRegionKHR *region = NULL;
       if (regions && regions->pRegions)
          region = &regions->pRegions[i];

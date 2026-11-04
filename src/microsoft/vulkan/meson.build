@@ -56,6 +56,12 @@ dzn_deps = [
 dzn_flags = [ ]
 dzn_cpp_flags = [ ]
 
+if host_machine.system() == 'linux' and dep_libdrm.found()
+  libdzn_files += files('../common/asb_drm_bridge.c')
+  dzn_deps += dep_libdrm
+  dzn_flags += '-DHAVE_ASB_DRM'
+endif
+
 if with_platform_windows
   libdzn_files += files('dzn_dxgi.c')
 endif
@@ -76,7 +82,8 @@ libvulkan_dzn = shared_library(
   'vulkan_dzn',
   [libdzn_files, dzn_entrypoints, dzn_drirc, sha1_h],
   vs_module_defs : vulkan_api_def,
-  include_directories : [inc_include, inc_src, inc_util],
+  include_directories : [inc_include, inc_src, inc_util,
+                         include_directories('../common')],
   dependencies : [dzn_deps, idep_vulkan_wsi, idep_xmlconfig],
   c_args : dzn_flags,
   cpp_args : dzn_cpp_flags,

@@ -225,12 +225,14 @@ d3d12_asb_format(enum pipe_format format)
 
 static bool
 d3d12_asb_export_buffer(struct d3d12_screen *screen,
-                        struct d3d12_resource *res)
+                        struct d3d12_resource *res,
+                        uint32_t imported_format = 0,
+                        uint32_t imported_pitch = 0)
 {
    if (res->bo->asb_buffer)
       return true;
    struct pipe_resource *pres = &res->base.b;
-   uint32_t format = d3d12_asb_format(pres->format);
+   uint32_t format = imported_format ? imported_format : d3d12_asb_format(pres->format);
    if (!format || pres->last_level || pres->array_size != 1 ||
        pres->nr_samples > 1 ||
        (pres->target != PIPE_TEXTURE_2D && pres->target != PIPE_TEXTURE_RECT))
@@ -244,9 +246,11 @@ d3d12_asb_export_buffer(struct d3d12_screen *screen,
    image.width = pres->width0;
    image.height = pres->height0;
    image.format = format;
-   image.pitch = pres->width0 * 4;
+   image.pitch = imported_pitch ? imported_pitch : pres->width0 * 4;
    res->bo->asb_buffer = asb_drm_buffer_create(screen->asb_bridge, &image);
    close(image.fd);
+   if (res->bo->asb_buffer)
+      res->bo->asb_pitch = image.pitch;
    return res->bo->asb_buffer != nullptr;
 }
 #endif
@@ -663,6 +667,7 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    HANDLE d3d_handle = (HANDLE) (intptr_t) handle->handle;
 #endif
 
+   bool asb_opaque_alias = false;
 #ifdef HAVE_ASB_DRM
    struct asb_drm_image asb_image = {};
    asb_image.fd = -1;
@@ -772,9 +777,21 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    if (asb_image.fd >= 0 &&
        (incoming_res_desc.Width != asb_image.width ||
         incoming_res_desc.Height != asb_image.height ||
-        (handle->stride && handle->stride != asb_image.pitch) ||
-        asb_image.format != d3d12_asb_format((enum pipe_format)handle->format)))
+        (handle->stride && handle->stride != asb_image.pitch)))
       goto invalid;
+   if (asb_image.fd >= 0) {
+      const enum pipe_format requested = (enum pipe_format)handle->format;
+      const DXGI_FORMAT dxgi = incoming_res_desc.Format;
+      asb_opaque_alias = asb_image.format == DRM_FORMAT_ARGB8888 &&
+         d3d12_asb_format(requested) == DRM_FORMAT_XRGB8888 &&
+         templ && d3d12_asb_format(templ->format) == DRM_FORMAT_XRGB8888 &&
+         (dxgi == DXGI_FORMAT_B8G8R8A8_UNORM ||
+          dxgi == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+          dxgi == DXGI_FORMAT_B8G8R8A8_TYPELESS);
+      if (!asb_opaque_alias &&
+          asb_image.format != d3d12_asb_format(requested))
+         goto invalid;
+   }
 #endif
 
    /* Get a description for this plane */
@@ -875,10 +892,11 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
          goto invalid;
       }
       if (templ->target != PIPE_BUFFER) {
-         if ((footprint->Format != d3d12_get_format(templ->format) &&
+         if (!asb_opaque_alias &&
+             ((footprint->Format != d3d12_get_format(templ->format) &&
               footprint->Format != d3d12_get_typeless_format(templ->format)) ||
              (incoming_res_desc.Format != d3d12_get_format((enum pipe_format)handle->format) &&
-              incoming_res_desc.Format != d3d12_get_typeless_format((enum pipe_format)handle->format))) {
+              incoming_res_desc.Format != d3d12_get_typeless_format((enum pipe_format)handle->format)))) {
             debug_printf("d3d12: Importing resource with mismatched format: "
                "plane could be DXGI format %d or %d, but is %d, "
                "overall could be DXGI format %d or %d, but is %d\n",
@@ -935,7 +953,8 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    if (!res->bo)
       goto invalid;
 #ifdef HAVE_ASB_DRM
-   if (asb_image.fd >= 0 && !d3d12_asb_export_buffer(screen, res))
+   if (asb_image.fd >= 0 &&
+       !d3d12_asb_export_buffer(screen, res, asb_image.format, asb_image.pitch))
       goto invalid;
 #endif
    init_valid_range(res);
@@ -977,7 +996,7 @@ d3d12_resource_get_handle(struct pipe_screen *pscreen,
             return false;
          handle->handle = fd;
       }
-      handle->stride = pres->width0 * 4;
+      handle->stride = res->bo->asb_pitch;
       handle->offset = 0;
       handle->format = pres->format;
       handle->modifier = DRM_FORMAT_MOD_INVALID;
@@ -1140,6 +1159,34 @@ d3d12_resource_get_param(struct pipe_screen *pscreen,
                          uint64_t *value)
 {
    struct d3d12_resource* res = d3d12_resource(pres);
+#ifdef HAVE_ASB_DRM
+   if (res->bo && res->bo->asb_buffer) {
+      if (plane || layer || level)
+         return false;
+      switch (param) {
+      case PIPE_RESOURCE_PARAM_NPLANES:
+         *value = 1;
+         return true;
+      case PIPE_RESOURCE_PARAM_STRIDE:
+         *value = res->bo->asb_pitch;
+         return true;
+      case PIPE_RESOURCE_PARAM_OFFSET:
+         *value = 0;
+         return true;
+      case PIPE_RESOURCE_PARAM_LAYER_STRIDE:
+         *value = (uint64_t)res->bo->asb_pitch * pres->height0;
+         return true;
+      case PIPE_RESOURCE_PARAM_DISJOINT_PLANES:
+         *value = false;
+         return true;
+      case PIPE_RESOURCE_PARAM_MODIFIER:
+         *value = DRM_FORMAT_MOD_INVALID;
+         return true;
+      default:
+         return false;
+      }
+   }
+#endif
    unsigned num_planes = util_format_get_num_planes(res->overall_format);
 
    pipe_resource *planes[d3d12_max_planes];

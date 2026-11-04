@@ -265,6 +265,19 @@ dzn_image_create(struct dzn_device *device,
        image->desc.SampleDesc.Count == 1)
       image->desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
 
+#ifdef HAVE_ASB_DRM
+   if (pdev->asb_render_fd >= 0 &&
+       (image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
+       image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+       image->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+       image->desc.DepthOrArraySize == 1 && image->desc.MipLevels == 1 &&
+       image->desc.SampleDesc.Count == 1 &&
+       image->desc.Width <= UINT32_MAX / 4 &&
+       (image->vk.format == VK_FORMAT_B8G8R8A8_UNORM ||
+        image->vk.format == VK_FORMAT_B8G8R8A8_SRGB))
+      image->asb_pitch = (uint32_t)image->desc.Width * 4;
+#endif
+
    *out = dzn_image_to_handle(image);
    return VK_SUCCESS;
 }
@@ -943,6 +956,16 @@ dzn_GetImageSubresourceLayout(VkDevice _device,
       layout->arrayPitch = 0;
       layout->size = image->linear.size;
    } else {
+#ifdef HAVE_ASB_DRM
+      if (image->asb_pitch) {
+         layout->offset = 0;
+         layout->rowPitch = image->asb_pitch;
+         layout->depthPitch = (VkDeviceSize)image->asb_pitch * image->desc.Height;
+         layout->arrayPitch = layout->depthPitch;
+         layout->size = layout->depthPitch;
+         return;
+      }
+#endif
       UINT subres_index =
          dzn_image_get_subresource_index(image, subresource,
                                          (VkImageAspectFlagBits)subresource->aspectMask);

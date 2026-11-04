@@ -31,6 +31,13 @@
 #include <directx/dxcore.h>
 #include <dxguids/dxguids.h>
 
+#if defined(HAVE_ASB_DRM) && defined(HAVE_DRISW_KMS)
+#include "frontend/sw_winsys.h"
+extern "C" {
+#include "gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.h"
+}
+#endif
+
 static IDXCoreAdapterFactory *
 get_dxcore_factory()
 {
@@ -252,6 +259,37 @@ d3d12_create_dxcore_screen(struct sw_winsys *winsys, LUID *adapter_luid)
    }
 
    return &screen->base.base;
+}
+
+struct pipe_screen *
+d3d12_create_drm_screen(int fd)
+{
+#if defined(HAVE_ASB_DRM) && defined(HAVE_DRISW_KMS)
+   uint64_t adapter_luid;
+   if (!asb_drm_query_adapter(fd, &adapter_luid))
+      return nullptr;
+
+   struct sw_winsys *winsys = kms_dri_create_winsys(fd);
+   if (!winsys)
+      return nullptr;
+
+   LUID luid = {(uint32_t)adapter_luid, (int32_t)(adapter_luid >> 32)};
+   struct pipe_screen *pscreen = d3d12_create_dxcore_screen(winsys, &luid);
+   if (!pscreen) {
+      winsys->destroy(winsys);
+      return nullptr;
+   }
+
+   struct d3d12_screen *screen = d3d12_screen(pscreen);
+   screen->owns_winsys = true;
+   if (!screen->asb_bridge) {
+      pscreen->destroy(pscreen);
+      return nullptr;
+   }
+   return pscreen;
+#else
+   return nullptr;
+#endif
 }
 
 struct pipe_screen *

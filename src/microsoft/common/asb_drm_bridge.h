@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -10,6 +11,9 @@ extern "C" {
 
 struct asb_drm_bridge;
 struct asb_drm_buffer;
+
+bool asb_drm_query_adapter(int fd, uint64_t *adapter_luid);
+int asb_drm_open_matching_render_node(uint64_t adapter_luid, dev_t *device_id);
 
 struct asb_drm_image {
     int fd;

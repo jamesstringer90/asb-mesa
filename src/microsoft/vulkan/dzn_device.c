@@ -52,6 +52,11 @@
 #include <stdlib.h>
 #include <c99_alloca.h>
 
+#ifdef HAVE_ASB_DRM
+#include "drm-uapi/drm_fourcc.h"
+#include <unistd.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
@@ -1109,6 +1114,10 @@ dzn_physical_device_create(struct vk_instance *instance,
    if (!pdev)
       return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+#ifdef HAVE_ASB_DRM
+   pdev->asb_render_fd = -1;
+#endif
+
    struct vk_physical_device_dispatch_table dispatch_table;
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch_table,
                                                       &dzn_physical_device_entrypoints,
@@ -1447,6 +1456,20 @@ dzn_physical_device_get_image_format_properties(struct dzn_physical_device *pdev
          VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT | import_export_feature_flags;
 
       switch (external_info->handleType) {
+#ifdef HAVE_ASB_DRM
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+         if (pdev->asb_render_fd < 0 || info->type != VK_IMAGE_TYPE_2D ||
+             info->tiling != VK_IMAGE_TILING_OPTIMAL ||
+             (info->format != VK_FORMAT_B8G8R8A8_UNORM &&
+              info->format != VK_FORMAT_B8G8R8A8_SRGB))
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+         external_props->externalMemoryProperties.compatibleHandleTypes =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+         external_props->externalMemoryProperties.externalMemoryFeatures =
+            VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+            VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
+         break;
+#endif
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT:
          external_props->externalMemoryProperties.compatibleHandleTypes = d3d11_texture_handle_types;
          external_props->externalMemoryProperties.exportFromImportedHandleTypes = d3d11_texture_handle_types;
@@ -2103,6 +2126,9 @@ dzn_queue_submit(struct vk_queue *q,
 static void
 dzn_queue_finish(struct dzn_queue *queue)
 {
+#ifdef HAVE_ASB_DRM
+   asb_drm_bridge_destroy(queue->asb_bridge);
+#endif
    if (queue->cmdqueue)
       ID3D12CommandQueue_Release(queue->cmdqueue);
 
@@ -2143,12 +2169,39 @@ dzn_queue_init(struct dzn_queue *queue,
       return vk_error(device->vk.physical->instance, VK_ERROR_INITIALIZATION_FAILED);
    }
 
-   if (FAILED(ID3D12Device1_CreateFence(device->dev, 0, D3D12_FENCE_FLAG_NONE,
+   if (FAILED(ID3D12Device1_CreateFence(device->dev, 0,
+#ifdef HAVE_ASB_DRM
+                                        device->asb_bridge ? D3D12_FENCE_FLAG_SHARED :
+#endif
+                                        D3D12_FENCE_FLAG_NONE,
                                         &IID_ID3D12Fence,
                                         (void **)&queue->fence))) {
       dzn_queue_finish(queue);
       return vk_error(device->vk.physical->instance, VK_ERROR_INITIALIZATION_FAILED);
    }
+
+#ifdef HAVE_ASB_DRM
+   if (device->asb_bridge) {
+      struct dzn_physical_device *asb_pdev =
+         container_of(device->vk.physical, struct dzn_physical_device, vk);
+      HANDLE handle = (HANDLE)(intptr_t)-1;
+      if (FAILED(ID3D12Device_CreateSharedHandle(device->dev,
+                                                 (ID3D12DeviceChild *)queue->fence,
+                                                 NULL, GENERIC_ALL, NULL,
+                                                 &handle))) {
+         dzn_queue_finish(queue);
+         return vk_error(device->vk.physical->instance, VK_ERROR_INITIALIZATION_FAILED);
+      }
+      queue->asb_bridge = asb_drm_bridge_create(asb_pdev->asb_render_fd,
+                                                dzn_asb_adapter_luid(asb_pdev),
+                                                (int)(intptr_t)handle);
+      close((int)(intptr_t)handle);
+      if (!queue->asb_bridge) {
+         dzn_queue_finish(queue);
+         return vk_error(device->vk.physical->instance, VK_ERROR_INITIALIZATION_FAILED);
+      }
+   }
+#endif
 
    return VK_SUCCESS;
 }
@@ -2212,6 +2265,12 @@ dzn_device_destroy(struct dzn_device *device, const VkAllocationCallbacks *pAllo
 
       dzn_queue_finish(queue);
    }
+
+#ifdef HAVE_ASB_DRM
+   asb_drm_bridge_destroy(device->asb_bridge);
+   if (device->asb_fence)
+      ID3D12Fence_Release(device->asb_fence);
+#endif
 
    dzn_device_query_finish(device);
    dzn_meta_finish(device);
@@ -2381,6 +2440,29 @@ dzn_device_create(struct dzn_physical_device *pdev,
       dzn_device_destroy(device, pAllocator);
       return result;
    }
+
+#ifdef HAVE_ASB_DRM
+   if (pdev->asb_render_fd >= 0) {
+      HANDLE fence_handle = (HANDLE)(intptr_t)-1;
+      if (FAILED(ID3D12Device1_CreateFence(device->dev, 0, D3D12_FENCE_FLAG_SHARED,
+                                           &IID_ID3D12Fence, (void **)&device->asb_fence)) ||
+          FAILED(ID3D12Device_CreateSharedHandle(device->dev,
+                                                 (ID3D12DeviceChild *)device->asb_fence,
+                                                 NULL, GENERIC_ALL, NULL,
+                                                 &fence_handle))) {
+         dzn_device_destroy(device, pAllocator);
+         return vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
+      }
+      device->asb_bridge = asb_drm_bridge_create(pdev->asb_render_fd,
+                                                 dzn_asb_adapter_luid(pdev),
+                                                 (int)(intptr_t)fence_handle);
+      close((int)(intptr_t)fence_handle);
+      if (!device->asb_bridge) {
+         dzn_device_destroy(device, pAllocator);
+         return vk_error(pdev, VK_ERROR_INITIALIZATION_FAILED);
+      }
+   }
+#endif
 
    uint32_t qindex = 0;
    for (uint32_t qf = 0; qf < pCreateInfo->queueCreateInfoCount; qf++) {
@@ -2561,6 +2643,10 @@ dzn_device_memory_destroy(struct dzn_device_memory *mem,
    if (mem->dedicated_res)
       ID3D12Resource_Release(mem->dedicated_res);
 
+#ifdef HAVE_ASB_DRM
+   asb_drm_buffer_destroy(mem->asb_buffer);
+#endif
+
 #ifdef _WIN32
    if (mem->export_handle)
       CloseHandle(mem->export_handle);
@@ -2711,6 +2797,23 @@ dzn_device_memory_create(struct dzn_device *device,
        VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT);
    if (image && imported_from_d3d11)
       valid_flags |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+
+#ifdef HAVE_ASB_DRM
+   bool asb_image = image && pdevice->asb_render_fd >= 0 &&
+      device->asb_bridge &&
+      image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+      image->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+      image->desc.DepthOrArraySize == 1 && image->desc.MipLevels == 1 &&
+      image->desc.SampleDesc.Count == 1 &&
+      image->desc.Width <= UINT32_MAX / 4 &&
+      (image->vk.format == VK_FORMAT_B8G8R8A8_UNORM ||
+       image->vk.format == VK_FORMAT_B8G8R8A8_SRGB) &&
+      (image->desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+       image->desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+       image->desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS);
+   if (asb_image)
+      valid_flags |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+#endif
 
    if (export_flags & ~valid_flags)
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
@@ -2920,6 +3023,22 @@ dzn_device_memory_create(struct dzn_device *device,
                                                  dwAccess, name, &mem->export_handle)))
          goto cleanup;
    }
+
+#ifdef HAVE_ASB_DRM
+   if (export_flags & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+      const struct asb_drm_image asb_image_info = {
+         .fd = (int)(intptr_t)mem->export_handle,
+         .width = (uint32_t)image->desc.Width,
+         .height = image->desc.Height,
+         .format = DRM_FORMAT_ARGB8888,
+         .pitch = (uint32_t)image->desc.Width * 4,
+      };
+      mem->asb_buffer = asb_drm_buffer_create(device->asb_bridge,
+                                              &asb_image_info);
+      if (!mem->asb_buffer)
+         goto cleanup;
+   }
+#endif
 
    *out = dzn_device_memory_to_handle(mem);
    return VK_SUCCESS;
@@ -3776,6 +3895,13 @@ dzn_GetMemoryFdKHR(VkDevice device,
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    switch (pGetFdInfo->handleType) {
+#ifdef HAVE_ASB_DRM
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+      if (!mem->asb_buffer)
+         return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      *pFd = asb_drm_buffer_fd(mem->asb_buffer);
+      return *pFd >= 0 ? VK_SUCCESS : vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+#endif
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT:
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT:

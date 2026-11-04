@@ -24,6 +24,11 @@
 #include "dzn_private.h"
 #include "vk_util.h"
 
+#ifdef HAVE_ASB_DRM
+#include <sys/sysmacros.h>
+#include <unistd.h>
+#endif
+
 static PFN_vkVoidFunction VKAPI_PTR
 dzn_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 {
@@ -54,6 +59,48 @@ dzn_wsi_needs_blits(VkDevice dev)
    return device->need_swapchain_blits;
 }
 
+#ifdef HAVE_ASB_DRM
+static bool
+dzn_wsi_can_present_on_device(VkPhysicalDevice physical, int fd)
+{
+   VK_FROM_HANDLE(dzn_physical_device, pdev, physical);
+   uint64_t luid;
+   return asb_drm_query_adapter(fd, &luid) && luid == dzn_asb_adapter_luid(pdev);
+}
+
+static void
+dzn_wsi_set_memory_ownership(VkDevice dev, VkDeviceMemory memory,
+                             VkBool32 ownership)
+{
+   VK_FROM_HANDLE(dzn_device, device, dev);
+   VK_FROM_HANDLE(dzn_device_memory, mem, memory);
+   if (!device->asb_bridge || !mem || !mem->asb_buffer)
+      return;
+   if (ownership && !asb_drm_buffer_wait(mem->asb_buffer, true))
+      vk_device_set_lost(&device->vk, "ASB dma-buf wait failed");
+}
+
+static VkResult
+dzn_wsi_prepare_present(struct vk_queue *q, VkDeviceMemory memory)
+{
+   struct dzn_queue *queue = container_of(q, struct dzn_queue, vk);
+   VK_FROM_HANDLE(dzn_device_memory, mem, memory);
+   if (!mem || !mem->asb_buffer)
+      return VK_SUCCESS;
+
+   assert(q->submit.mode == VK_QUEUE_SUBMIT_MODE_IMMEDIATE);
+   int sync_fd = asb_drm_export_fence(queue->asb_bridge, queue->fence_point);
+   if (sync_fd < 0)
+      return vk_queue_set_lost(q, "ASB present fence export failed");
+
+   bool success = asb_drm_buffer_set_fence(mem->asb_buffer, sync_fd, true);
+   close(sync_fd);
+   if (!success)
+      return vk_queue_set_lost(q, "ASB present fence import failed");
+   return VK_SUCCESS;
+}
+#endif
+
 static VkResult
 dzn_wsi_create_image_memory(VkDevice dev, void *resource,
                             const VkAllocationCallbacks *alloc,
@@ -80,6 +127,10 @@ dzn_wsi_finish(struct dzn_physical_device *physical_device)
 {
    wsi_device_finish(&physical_device->wsi_device,
                      &physical_device->vk.instance->alloc);
+#ifdef HAVE_ASB_DRM
+   if (physical_device->asb_render_fd >= 0)
+      close(physical_device->asb_render_fd);
+#endif
 }
 
 VkResult
@@ -91,6 +142,39 @@ dzn_wsi_init(struct dzn_physical_device *physical_device)
    bool sw = false;
 #else
    bool sw = true;
+#ifdef HAVE_ASB_DRM
+   physical_device->asb_render_fd =
+      asb_drm_open_matching_render_node(dzn_asb_adapter_luid(physical_device),
+                                        &physical_device->asb_render_device);
+   if (physical_device->asb_render_fd >= 0) {
+      ID3D12Fence *fence = NULL;
+      HANDLE handle = (HANDLE)(intptr_t)-1;
+      if (SUCCEEDED(ID3D12Device1_CreateFence(physical_device->dev, 0,
+                                              D3D12_FENCE_FLAG_SHARED,
+                                              &IID_ID3D12Fence,
+                                              (void **)&fence))) {
+         if (SUCCEEDED(ID3D12Device_CreateSharedHandle(physical_device->dev,
+                                                       (ID3D12DeviceChild *)fence,
+                                                       NULL, GENERIC_ALL, NULL,
+                                                       &handle))) {
+            struct asb_drm_bridge *bridge =
+               asb_drm_bridge_create(physical_device->asb_render_fd,
+                                     dzn_asb_adapter_luid(physical_device),
+                                     (int)(intptr_t)handle);
+            if (bridge) {
+               sw = false;
+               asb_drm_bridge_destroy(bridge);
+            }
+            close((int)(intptr_t)handle);
+         }
+         ID3D12Fence_Release(fence);
+      }
+      if (sw) {
+         close(physical_device->asb_render_fd);
+         physical_device->asb_render_fd = -1;
+      }
+   }
+#endif
 #endif
 
    result = wsi_device_init(&physical_device->wsi_device,
@@ -100,8 +184,15 @@ dzn_wsi_init(struct dzn_physical_device *physical_device)
                             -1, NULL,
                             &(struct wsi_device_options){.sw_device = sw});
 
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+#ifdef HAVE_ASB_DRM
+      if (physical_device->asb_render_fd >= 0) {
+         close(physical_device->asb_render_fd);
+         physical_device->asb_render_fd = -1;
+      }
+#endif
       return result;
+   }
 
    physical_device->wsi_device.win32.get_d3d12_command_queue =
       dzn_wsi_get_d3d12_command_queue;
@@ -110,6 +201,20 @@ dzn_wsi_init(struct dzn_physical_device *physical_device)
    physical_device->wsi_device.win32.create_image_memory =
       dzn_wsi_create_image_memory;
    physical_device->wsi_device.supports_modifiers = false;
+#ifdef HAVE_ASB_DRM
+   if (!sw) {
+      physical_device->wsi_device.wayland.disable_timestamps = true;
+      physical_device->wsi_device.disable_unordered_submits = true;
+      physical_device->wsi_device.can_present_on_device =
+         dzn_wsi_can_present_on_device;
+      physical_device->wsi_device.set_memory_ownership =
+         dzn_wsi_set_memory_ownership;
+      physical_device->wsi_device.prepare_present = dzn_wsi_prepare_present;
+      physical_device->wsi_device.drm_info.hasRender = true;
+      physical_device->wsi_device.drm_info.renderMajor = major(physical_device->asb_render_device);
+      physical_device->wsi_device.drm_info.renderMinor = minor(physical_device->asb_render_device);
+   }
+#endif
    physical_device->vk.wsi_device = &physical_device->wsi_device;
 
    return VK_SUCCESS;

@@ -187,6 +187,8 @@ struct wsi_device {
                                 VkDeviceMemory memory,
                                 VkBool32 ownership);
 
+   VkResult (*prepare_present)(struct vk_queue *queue, VkDeviceMemory memory);
+
    /*
     * If this is set, the WSI device will call it to let the driver backend
     * decide if it can present images directly on the given device fd.

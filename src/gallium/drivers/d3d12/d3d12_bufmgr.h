@@ -53,6 +53,7 @@ struct d3d12_bo {
    ID3D12Resource *res;
    struct pb_buffer *buffer;
    struct asb_drm_buffer *asb_buffer;
+   uint32_t asb_pitch;
    struct d3d12_resource_state global_state;
 
    /* Used as a key in per-context resource state maps,

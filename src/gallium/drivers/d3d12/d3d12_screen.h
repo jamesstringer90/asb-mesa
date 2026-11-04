@@ -74,6 +74,7 @@ struct d3d12_memory_info {
 struct d3d12_screen {
    struct pipe_screen base;
    struct sw_winsys *winsys;
+   bool owns_winsys;
    struct asb_drm_bridge *asb_bridge;
    uint32_t asb_sync_failed;
    LUID adapter_luid;

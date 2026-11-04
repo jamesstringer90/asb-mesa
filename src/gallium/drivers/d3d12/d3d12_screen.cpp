@@ -707,6 +707,8 @@ d3d12_destroy_screen(struct d3d12_screen *screen)
 
    if (screen->d3d12_mod)
       util_dl_close(screen->d3d12_mod);
+   if (screen->owns_winsys)
+      screen->winsys->destroy(screen->winsys);
 #ifdef HAVE_GALLIUM_D3D12_GRAPHICS
    glsl_type_singleton_decref();
 #endif // HAVE_GALLIUM_D3D12_GRAPHICS

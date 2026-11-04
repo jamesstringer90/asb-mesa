@@ -5,6 +5,7 @@
 #include "target-helpers/inline_debug_helper.h"
 #include "target-helpers/drm_helper_public.h"
 #include "frontend/drm_driver.h"
+#include "util/detect_os.h"
 #include "util/driconf.h"
 
 /**
@@ -480,6 +481,20 @@ DRM_DRIVER_DESCRIPTOR(ethosu, NULL, 0)
 
 #else
 DRM_DRIVER_DESCRIPTOR_STUB(ethosu)
+#endif
+
+#if defined(GALLIUM_D3D12) && DETECT_OS_LINUX
+#include "d3d12/d3d12_public.h"
+
+static struct pipe_screen *
+pipe_d3d12_create_screen(int fd, const struct pipe_screen_config *config)
+{
+   struct pipe_screen *screen = d3d12_create_drm_screen(fd);
+   return screen ? debug_screen_wrap(screen) : NULL;
+}
+DRM_DRIVER_DESCRIPTOR(d3d12, NULL, 0)
+#else
+DRM_DRIVER_DESCRIPTOR_STUB(d3d12)
 #endif
 
 #ifdef GALLIUM_KMSRO

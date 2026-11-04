@@ -802,6 +802,11 @@ loader_get_driver_for_fd(int fd)
    if (!driver)
       driver = loader_get_kernel_driver_name(fd);
 
+   if (driver && strcmp(driver, "asb_drm") == 0) {
+      free(driver);
+      driver = strdup("d3d12");
+   }
+
    return driver;
 }
 

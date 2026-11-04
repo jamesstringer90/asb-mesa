@@ -3,12 +3,16 @@
 #include "d3dkmthk.h"
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/dma-buf.h>
 #include <poll.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -43,21 +47,70 @@ static void asb_drm_close_handle(int fd, uint32_t handle)
     asb_drm_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &close_handle);
 }
 
-struct asb_drm_bridge *asb_drm_bridge_create(int fd, uint64_t adapter_luid,
-                                          int fence_fd)
+bool asb_drm_query_adapter(int fd, uint64_t *adapter_luid)
 {
-    struct drm_asb_gpu_query query = {0};
-    struct drm_asb_gpu_native native = {0};
-    struct asb_drm_bridge *bridge;
     const uint32_t required = ASB_DRM_GPU_CAP_BUFFER_IMPORT |
                               ASB_DRM_GPU_CAP_NATIVE_HANDLES |
                               ASB_DRM_GPU_CAP_SYNC_FILE |
                               ASB_DRM_GPU_CAP_PRESENT;
+    struct drm_asb_gpu_query query = {0};
 
     if (fd < 0 || asb_drm_ioctl(fd, DRM_IOCTL_ASB_GPU_QUERY, &query) < 0 ||
         query.version != ASB_DRM_GPU_VERSION ||
-        query.adapter_luid != adapter_luid ||
         (query.capabilities & required) != required)
+        return false;
+    if (adapter_luid)
+        *adapter_luid = query.adapter_luid;
+    return true;
+}
+
+int asb_drm_open_matching_render_node(uint64_t adapter_luid, dev_t *device_id)
+{
+    DIR *dir = opendir("/dev/dri");
+    struct dirent *entry;
+    int found = -1;
+
+    if (!dir)
+        return -1;
+    while ((entry = readdir(dir))) {
+        char path[128];
+        struct stat statbuf;
+        uint64_t found_luid;
+        int fd;
+
+        if (strncmp(entry->d_name, "renderD", 7) ||
+            strspn(entry->d_name + 7, "0123456789") !=
+                strlen(entry->d_name + 7) ||
+            !entry->d_name[7] ||
+            snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name) >=
+                sizeof(path))
+            continue;
+        fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        if (fstat(fd, &statbuf) == 0 && S_ISCHR(statbuf.st_mode) &&
+            asb_drm_query_adapter(fd, &found_luid) &&
+            found_luid == adapter_luid) {
+            if (device_id)
+                *device_id = statbuf.st_rdev;
+            found = fd;
+            break;
+        }
+        close(fd);
+    }
+    closedir(dir);
+    return found;
+}
+
+struct asb_drm_bridge *asb_drm_bridge_create(int fd, uint64_t adapter_luid,
+                                          int fence_fd)
+{
+    struct drm_asb_gpu_native native = {0};
+    struct asb_drm_bridge *bridge;
+    uint64_t found_luid;
+
+    if (!asb_drm_query_adapter(fd, &found_luid) ||
+        found_luid != adapter_luid)
         return NULL;
     bridge = calloc(1, sizeof(*bridge));
     if (!bridge)
