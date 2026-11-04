@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/jamesstringer90/asb-mesa.git",
+  "tag": "2026-11-04",
+  "upstreamTag": "mesa-26.2.6",
+  "revision": "657c6350b5ff03bc32be0c347d2ce9f73688a766",
+  "target": "ubuntu-26.04-amd64",
+  "archive": "prebuilt/ubuntu-26.04-amd64/wsl-mesa.tar.zst",
+  "archiveSha256": "b0094dd851ede564738183a44383406a1d440b25cf9240e2598748ed7e44f809",
+  "asbDrmInterfaceVersion": 1
+}

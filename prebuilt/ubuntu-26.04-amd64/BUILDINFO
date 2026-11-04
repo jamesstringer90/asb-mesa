@@ -1,0 +1,22 @@
+ubuntu: 26.04 (resolute)
+arch: amd64
+built-on: 2026-11-04T14:03:40Z
+mesa-version: 26.2.6
+mesa-source: https://archive.mesa3d.org/mesa-26.2.6.tar.xz
+mesa-source-sha256: b9436b3e1a8be76fbd4823dc884f90596ab7c6ac5e1867a305e66ffccfb31a92
+archive-sha256: b0094dd851ede564738183a44383406a1d440b25cf9240e2598748ed7e44f809
+llvm: 21.1.8
+meson: 1.10.1
+ninja: 1.13.2
+directx-headers: 1.619.1
+libdrm: 2.4.131
+spirv-tools: 2026.1
+gallium-drivers: llvmpipe,d3d12
+vulkan-drivers: swrast,microsoft-experimental
+icd-name: dzn_icd.x86_64.json
+asb-drm-patch-sha256: 4687ee4bc1f13fcb5f3d1955bd0e0e9ce677a30b160e556657cbecde894ccd38
+asb-drm-bridge-sha256: 5b0e6b2ddd40068b95d166d054c7e167c0deef6f014bd0a9a255e88f6273af77
+asb-drm-bridge-header-sha256: 94574596e7acb06590a8d15cfdd8445b66dbdfeb6e7ddf702c74036eb48daa97
+source-repository: https://github.com/jamesstringer90/asb-mesa.git
+source-revision: 657c6350b5ff03bc32be0c347d2ce9f73688a766
+source-tag: 2026-11-04
