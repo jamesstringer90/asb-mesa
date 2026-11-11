@@ -22,6 +22,7 @@
  */
 
 #include "dzn_private.h"
+#include "vk_nir_convert_ycbcr.h"
 
 #include "spirv/nir_spirv.h"
 
@@ -211,6 +212,57 @@ struct dzn_nir_options {
    const nir_shader_compiler_options *nir_opts;
 };
 
+static const struct vk_ycbcr_conversion_state *
+dzn_ycbcr_conversion_lookup(const void *data, uint32_t set,
+                            uint32_t binding, uint32_t array_index)
+{
+   const struct dzn_pipeline_layout *layout = data;
+   if (set >= layout->vk.set_count || !layout->vk.set_layouts[set])
+      return NULL;
+   const struct dzn_descriptor_set_layout *set_layout =
+      container_of(layout->vk.set_layouts[set], struct dzn_descriptor_set_layout, vk);
+   if (binding >= set_layout->binding_count)
+      return NULL;
+   uint32_t idx = set_layout->bindings[binding].immutable_sampler_idx;
+   if (idx >= set_layout->immutable_sampler_count ||
+       array_index >= set_layout->immutable_sampler_count - idx)
+      return NULL;
+   const struct vk_ycbcr_conversion_state *conversion =
+      &set_layout->immutable_ycbcr[idx + array_index];
+   return conversion->format != VK_FORMAT_UNDEFINED ? conversion : NULL;
+}
+
+static bool
+dzn_nir_normalize_ycbcr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (nir_tex_instr_src_index(tex, nir_tex_src_plane) < 0)
+      return false;
+   int idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   if (idx < 0)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(tex->src[idx].src);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (!var)
+      return false;
+   unsigned array_index = 0;
+   if (deref->deref_type == nir_deref_type_array) {
+      if (!nir_src_is_const(deref->arr.index))
+         return false;
+      array_index = nir_src_as_uint(deref->arr.index);
+   }
+   const struct vk_ycbcr_conversion_state *conversion =
+      dzn_ycbcr_conversion_lookup(data, var->data.descriptor_set, var->data.binding, array_index);
+   if (!conversion || conversion->format != VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16)
+      return false;
+   b->cursor = nir_after_instr(instr);
+   nir_def *scaled = nir_fmul_imm(b, &tex->def, 65535.0 / 65472.0);
+   nir_def_rewrite_uses_after(&tex->def, scaled);
+   return true;
+}
+
 static VkResult
 dzn_pipeline_get_nir_shader(struct dzn_device *device,
                             const struct dzn_pipeline_layout *layout,
@@ -271,6 +323,9 @@ dzn_pipeline_get_nir_shader(struct dzn_device *device,
       .shader_model_max = dzn_get_shader_model(pdev),
    };
 
+   NIR_PASS(_, *nir, nir_vk_lower_ycbcr_tex, dzn_ycbcr_conversion_lookup, layout);
+   NIR_PASS(_, *nir, nir_shader_instructions_pass, dzn_nir_normalize_ycbcr,
+            nir_metadata_control_flow, (void *)layout);
    dxil_spirv_nir_passes(*nir, &conf, metadata);
 
    if (stage == MESA_SHADER_VERTEX) {

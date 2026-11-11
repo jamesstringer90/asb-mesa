@@ -49,7 +49,9 @@ vk_sync_binary_init(struct vk_device *device,
    binary->next_point = (initial_value == 0);
 
    return vk_sync_init(device, &binary->timeline, btype->timeline_type,
-                       VK_SYNC_IS_TIMELINE, 0 /* initial_value */);
+                       VK_SYNC_IS_TIMELINE |
+                       (sync->flags & VK_SYNC_IS_SHAREABLE),
+                       0 /* initial_value */);
 }
 
 static void

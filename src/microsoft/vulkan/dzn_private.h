@@ -33,6 +33,7 @@
 #include "vk_descriptor_set_layout.h"
 #include "vk_device.h"
 #include "vk_image.h"
+#include "vk_ycbcr_conversion.h"
 #include "vk_log.h"
 #include "vk_physical_device.h"
 #include "vk_pipeline_layout.h"
@@ -205,6 +206,7 @@ struct dzn_physical_device {
 #ifdef HAVE_ASB_DRM
    int asb_render_fd;
    dev_t asb_render_device;
+   struct drm_asb_gpu_query asb_gpu;
 #endif
 
    ID3D12Device4 *dev;
@@ -331,6 +333,11 @@ struct dzn_device {
    bool bindless;
    bool support_static_samplers;
    struct dzn_device_descriptor_heap device_heaps[NUM_POOL_TYPES];
+#ifndef _WIN32
+   mtx_t sync_file_lock;
+   struct list_head sync_file_waiters;
+   bool sync_file_initialized;
+#endif
 #ifdef HAVE_ASB_DRM
    struct asb_drm_bridge *asb_bridge;
    ID3D12Fence *asb_fence;
@@ -373,6 +380,8 @@ struct dzn_device_memory {
 
 #ifdef HAVE_ASB_DRM
    struct asb_drm_buffer *asb_buffer;
+   int asb_dma_buf_fd;
+   uint32_t asb_pitch;
 #endif
 
    /* These flags need to be added into all resources created on this heap */
@@ -698,6 +707,13 @@ enum dzn_internal_buf_bucket {
    DZN_INTERNAL_BUF_BUCKET_COUNT,
 };
 
+#ifdef HAVE_ASB_DRM
+struct dzn_cmd_external_access {
+   int dma_buf_fd;
+   bool release;
+};
+#endif
+
 struct dzn_cmd_buffer {
    struct vk_command_buffer vk;
    struct dzn_cmd_buffer_state state;
@@ -712,6 +728,10 @@ struct dzn_cmd_buffer {
       struct hash_table *ht;
       struct util_dynarray signal;
    } events;
+
+#ifdef HAVE_ASB_DRM
+   struct util_dynarray external_access;
+#endif
 
    struct {
       struct hash_table *ht;
@@ -796,6 +816,7 @@ struct dzn_descriptor_set_layout {
    const D3D12_STATIC_SAMPLER_DESC1 *static_samplers;
    uint32_t immutable_sampler_count;
    const struct dzn_sampler **immutable_samplers;
+   struct vk_ycbcr_conversion_state *immutable_ycbcr;
 
    struct {
       uint32_t bindings[MAX_DYNAMIC_BUFFERS];
@@ -1087,14 +1108,39 @@ struct dzn_image {
    } linear;
    D3D12_RESOURCE_DESC desc;
    ID3D12Resource *res;
+   D3D12_RESOURCE_DESC plane_descs[2];
+   ID3D12Resource *plane_resources[2];
+   uint64_t plane_offsets[2];
 #ifdef HAVE_ASB_DRM
    uint32_t asb_pitch;
+   int asb_dma_buf_fd;
 #endif
    uint32_t castable_format_count;
    const DXGI_FORMAT *castable_formats;
 
    D3D12_BARRIER_ACCESS valid_access;
 };
+
+static inline VkImageAspectFlags
+dzn_image_aspects(const struct dzn_image *image, VkImageAspectFlags aspects)
+{
+   return aspects == VK_IMAGE_ASPECT_COLOR_BIT ? image->vk.aspects : aspects;
+}
+
+static inline unsigned
+dzn_image_aspect_plane(VkImageAspectFlags aspect)
+{
+   return (aspect & VK_IMAGE_ASPECT_PLANE_0_BIT) ? 0 :
+          (aspect & VK_IMAGE_ASPECT_PLANE_1_BIT) ? 1 :
+          (aspect & VK_IMAGE_ASPECT_PLANE_2_BIT) ? 2 :
+          aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : 0;
+}
+
+static inline ID3D12Resource *
+dzn_image_plane_resource(const struct dzn_image *image, unsigned plane)
+{
+   return plane && image->plane_descs[0].Width ? image->plane_resources[plane - 1] : image->res;
+}
 
 bool
 dzn_image_formats_are_compatible(const struct dzn_device *device,
@@ -1165,6 +1211,7 @@ struct dzn_image_view {
    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc;
    int srv_bindless_slot;
    int uav_bindless_slot;
+   int plane_bindless_slots[2];
 };
 
 void
@@ -1233,6 +1280,7 @@ struct dzn_buffer_view {
 
 struct dzn_sampler {
    struct vk_object_base base;
+   struct vk_ycbcr_conversion_state ycbcr;
    D3D12_SAMPLER_DESC2 desc;
    D3D12_STATIC_BORDER_COLOR static_border_color;
    int bindless_slot;
@@ -1259,7 +1307,7 @@ void dzn_translate_rect(D3D12_RECT *out, const VkRect2D *in);
 
 #define dzn_foreach_aspect(aspect, mask) \
         for (VkImageAspectFlagBits aspect = VK_IMAGE_ASPECT_COLOR_BIT; \
-             aspect <= VK_IMAGE_ASPECT_STENCIL_BIT; \
+             aspect <= VK_IMAGE_ASPECT_PLANE_2_BIT; \
              aspect = (VkImageAspectFlagBits)(aspect << 1)) \
            if (mask & aspect)
 
@@ -1319,6 +1367,11 @@ struct dzn_sync {
 };
 
 extern const struct vk_sync_type dzn_sync_type;
+#ifndef _WIN32
+void dzn_sync_binary_type_init(struct vk_sync_binary_type *type);
+VkResult dzn_sync_device_init(struct dzn_device *device);
+void dzn_sync_device_finish(struct dzn_device *device);
+#endif
 
 struct dzn_query {
    D3D12_QUERY_TYPE type;

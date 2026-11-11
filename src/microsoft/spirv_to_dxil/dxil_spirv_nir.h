@@ -74,6 +74,7 @@ struct dxil_spirv_bindless_entry {
       uint32_t buffer_offset;
       uint32_t sampler_idx;
    };
+   uint32_t plane_idx[2];
 };
 
 bool

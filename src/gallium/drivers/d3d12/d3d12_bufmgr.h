@@ -54,6 +54,7 @@ struct d3d12_bo {
    struct pb_buffer *buffer;
    struct asb_drm_buffer *asb_buffer;
    uint32_t asb_pitch;
+   bool asb_explicit_modifier;
    struct d3d12_resource_state global_state;
 
    /* Used as a key in per-context resource state maps,

@@ -52,9 +52,14 @@
 #include <stdlib.h>
 #include <c99_alloca.h>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #ifdef HAVE_ASB_DRM
 #include "drm-uapi/drm_fourcc.h"
-#include <unistd.h>
+#include <sys/sysmacros.h>
 #endif
 
 #ifdef _WIN32
@@ -100,6 +105,61 @@ static const struct vk_instance_extension_table instance_extensions = {
    .EXT_debug_utils                          = true,
 };
 
+#ifdef HAVE_ASB_DRM
+static void
+dzn_physical_device_init_asb(struct dzn_physical_device *pdev)
+{
+   if (pdev->asb_render_fd < 0)
+      return;
+
+   struct vk_device_extension_table *exts = &pdev->vk.supported_extensions;
+   exts->EXT_external_memory_dma_buf = true;
+   exts->EXT_image_drm_format_modifier =
+      (pdev->asb_gpu.capabilities & ASB_DRM_GPU_CAP_MODIFIERS) != 0;
+   exts->EXT_physical_device_drm = true;
+   exts->EXT_queue_family_foreign = true;
+
+   struct vk_properties *props = &pdev->vk.properties;
+   props->drmHasRender = true;
+   props->drmRenderMajor = major(pdev->asb_render_device);
+   props->drmRenderMinor = minor(pdev->asb_render_device);
+   dev_t primary;
+   if (asb_drm_primary_node(pdev->asb_render_device, &primary)) {
+      props->drmHasPrimary = true;
+      props->drmPrimaryMajor = major(primary);
+      props->drmPrimaryMinor = minor(primary);
+   }
+}
+
+static bool
+dzn_asb_format_supported(const struct dzn_physical_device *pdev, VkFormat format)
+{
+   if (pdev->asb_render_fd < 0 ||
+       !asb_drm_format(pdev->asb_gpu.capabilities, vk_format_to_pipe_format(format)))
+      return false;
+
+   D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {
+      .Format = dzn_image_get_dxgi_format(pdev, format, 0, 0),
+   };
+   const D3D12_FORMAT_SUPPORT1 required = D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+                                          D3D12_FORMAT_SUPPORT1_SHADER_LOAD;
+   return support.Format != DXGI_FORMAT_UNKNOWN &&
+          SUCCEEDED(ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_FORMAT_SUPPORT,
+                                                      &support, sizeof(support))) &&
+          (support.Support1 & required) == required;
+}
+#endif
+
+static bool
+dzn_ycbcr_format_supported(const struct dzn_physical_device *pdev, VkFormat format);
+
+static bool
+dzn_ycbcr_supported(const struct dzn_physical_device *pdev)
+{
+   return dzn_ycbcr_format_supported(pdev, VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM) &&
+          dzn_ycbcr_format_supported(pdev, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM);
+}
+
 static void
 dzn_physical_device_get_extensions(struct dzn_physical_device *pdev)
 {
@@ -127,6 +187,7 @@ dzn_physical_device_get_extensions(struct dzn_physical_device *pdev)
       .KHR_image_format_list                 = true,
       .KHR_imageless_framebuffer             = true,
       .KHR_get_memory_requirements2          = true,
+      .KHR_sampler_ycbcr_conversion          = dzn_ycbcr_supported(pdev),
       .KHR_maintenance1                      = true,
       .KHR_maintenance2                      = true,
       .KHR_maintenance3                      = true,
@@ -740,7 +801,7 @@ dzn_physical_device_get_features(const struct dzn_physical_device *pdev,
       .variablePointersStorageBuffer      = false,
       .variablePointers                   = false,
       .protectedMemory                    = false,
-      .samplerYcbcrConversion             = false,
+      .samplerYcbcrConversion             = dzn_ycbcr_supported(pdev),
       .shaderDrawParameters               = true,
 
       .samplerMirrorClampToEdge           = true,
@@ -1189,6 +1250,10 @@ dzn_physical_device_create(struct vk_instance *instance,
    dzn_physical_device_get_properties(pdev, &pdev->vk.properties);
 
    result = dzn_wsi_init(pdev);
+#ifdef HAVE_ASB_DRM
+   if (result == VK_SUCCESS)
+      dzn_physical_device_init_asb(pdev);
+#endif
    if (result != VK_SUCCESS || !pdev->dev) {
       list_del(&pdev->vk.link);
       dzn_physical_device_release(pdev);
@@ -1288,11 +1353,53 @@ dzn_physical_device_get_format_support(struct dzn_physical_device *pdev,
    return dfmt_info;
 }
 
+static bool
+dzn_ycbcr_format_supported(const struct dzn_physical_device *pdev, VkFormat format)
+{
+   if (format != VK_FORMAT_G8_B8R8_2PLANE_420_UNORM &&
+       format != VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM &&
+       format != VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16)
+      return false;
+   if (pdev->shader_model < D3D_SHADER_MODEL_6_6)
+      return false;
+   struct dzn_instance *instance = container_of(pdev->vk.instance, struct dzn_instance, vk);
+   if (instance->debug_flags & DZN_DEBUG_NO_BINDLESS)
+      return false;
+   D3D12_FEATURE_DATA_FORMAT_SUPPORT resource = {
+      .Format = dzn_image_get_dxgi_format(pdev, format, 0, 0),
+   };
+   if (FAILED(ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_FORMAT_SUPPORT,
+                                               &resource, sizeof(resource))) ||
+       !(resource.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D))
+      return false;
+   for (unsigned p = 0; p < vk_format_get_plane_count(format); p++) {
+      D3D12_FEATURE_DATA_FORMAT_SUPPORT plane = {
+         .Format = dzn_image_get_dxgi_format(pdev, format, VK_IMAGE_USAGE_SAMPLED_BIT,
+                                            VK_IMAGE_ASPECT_PLANE_0_BIT << p),
+      };
+      if (FAILED(ID3D12Device1_CheckFeatureSupport(pdev->dev, D3D12_FEATURE_FORMAT_SUPPORT,
+                                                  &plane, sizeof(plane))) ||
+          !(plane.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE))
+         return false;
+   }
+   return true;
+}
+
 static void
 dzn_physical_device_get_format_properties(struct dzn_physical_device *pdev,
                                           VkFormat format,
                                           VkFormatProperties2 *properties)
 {
+   if (vk_format_get_plane_count(format) > 1) {
+      properties->formatProperties = (VkFormatProperties) {0};
+      if (dzn_ycbcr_format_supported(pdev, format))
+         properties->formatProperties.optimalTilingFeatures =
+            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT | VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
+      return;
+   }
    D3D12_FEATURE_DATA_FORMAT_SUPPORT dfmt_info =
       dzn_physical_device_get_format_support(pdev, format, 0);
    VkFormatProperties *base_props = &properties->formatProperties;
@@ -1430,6 +1537,26 @@ dzn_physical_device_get_image_format_properties(struct dzn_physical_device *pdev
       }
    }
 
+#ifdef HAVE_ASB_DRM
+   VkPhysicalDeviceImageFormatInfo2 asb_info;
+   const bool drm_modifier = info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   if (drm_modifier) {
+      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
+         vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+      if (!mod_info || mod_info->drmFormatModifier != ASB_DRM_FORMAT_MOD_D3D12 ||
+          !(pdev->asb_gpu.capabilities & ASB_DRM_GPU_CAP_MODIFIERS) ||
+          !dzn_asb_format_supported(pdev, info->format) ||
+          info->type != VK_IMAGE_TYPE_2D ||
+          (info->flags & (VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT |
+                          VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                          VK_IMAGE_CREATE_DISJOINT_BIT)))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      asb_info = *info;
+      asb_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+      info = &asb_info;
+   }
+#endif
+
    assert(info->tiling == VK_IMAGE_TILING_OPTIMAL || info->tiling == VK_IMAGE_TILING_LINEAR);
 
    /* Extract output structs */
@@ -1445,6 +1572,32 @@ dzn_physical_device_get_image_format_properties(struct dzn_physical_device *pdev
       }
    }
 
+   if (vk_format_get_plane_count(info->format) > 1) {
+      if (!dzn_ycbcr_format_supported(pdev, info->format) ||
+          info->type != VK_IMAGE_TYPE_2D || info->tiling != VK_IMAGE_TILING_OPTIMAL ||
+          info->flags ||
+          (usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT)) ||
+          (external_info && external_info->handleType))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      properties->imageFormatProperties = (VkImageFormatProperties) {
+         .maxExtent = {D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, 1},
+         .maxMipLevels = 1,
+         .maxArrayLayers = 1,
+         .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
+         .maxResourceSize = UINT32_MAX,
+      };
+      VkSamplerYcbcrConversionImageFormatProperties *ycbcr =
+         vk_find_struct(properties->pNext, SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES);
+      if (ycbcr)
+         ycbcr->combinedImageSamplerDescriptorCount = 1;
+      return VK_SUCCESS;
+   }
+   VkSamplerYcbcrConversionImageFormatProperties *ycbcr =
+      vk_find_struct(properties->pNext, SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES);
+   if (ycbcr)
+      ycbcr->combinedImageSamplerDescriptorCount = 1;
+
    if (external_info && external_info->handleType != 0) {
       const VkExternalMemoryHandleTypeFlags d3d12_resource_handle_types =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT | opaque_external_flag;
@@ -1458,16 +1611,20 @@ dzn_physical_device_get_image_format_properties(struct dzn_physical_device *pdev
       switch (external_info->handleType) {
 #ifdef HAVE_ASB_DRM
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
-         if (pdev->asb_render_fd < 0 || info->type != VK_IMAGE_TYPE_2D ||
-             info->tiling != VK_IMAGE_TILING_OPTIMAL ||
-             (info->format != VK_FORMAT_B8G8R8A8_UNORM &&
-              info->format != VK_FORMAT_B8G8R8A8_SRGB))
+         if (!dzn_asb_format_supported(pdev, info->format) ||
+             info->type != VK_IMAGE_TYPE_2D ||
+             info->tiling != VK_IMAGE_TILING_OPTIMAL)
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
-         external_props->externalMemoryProperties.compatibleHandleTypes =
-            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-         external_props->externalMemoryProperties.externalMemoryFeatures =
-            VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
-            VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
+         if (external_props) {
+            external_props->externalMemoryProperties.compatibleHandleTypes =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            external_props->externalMemoryProperties.exportFromImportedHandleTypes =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            external_props->externalMemoryProperties.externalMemoryFeatures =
+               VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+               VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT |
+               VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
+         }
          break;
 #endif
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT:
@@ -1641,6 +1798,20 @@ dzn_physical_device_get_image_format_properties(struct dzn_physical_device *pdev
    /* TODO: set correct value here */
    properties->imageFormatProperties.maxResourceSize = UINT32_MAX;
 
+#ifdef HAVE_ASB_DRM
+   const bool asb_image = drm_modifier ||
+      (external_info && external_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+   if (asb_image) {
+      properties->imageFormatProperties.maxExtent.width =
+         MIN2(properties->imageFormatProperties.maxExtent.width, pdev->asb_gpu.max_width);
+      properties->imageFormatProperties.maxExtent.height =
+         MIN2(properties->imageFormatProperties.maxExtent.height, pdev->asb_gpu.max_height);
+      properties->imageFormatProperties.maxMipLevels = 1;
+      properties->imageFormatProperties.maxArrayLayers = 1;
+      properties->imageFormatProperties.sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+   }
+#endif
+
    return VK_SUCCESS;
 }
 
@@ -1652,6 +1823,48 @@ dzn_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    VK_FROM_HANDLE(dzn_physical_device, pdev, physicalDevice);
 
    dzn_physical_device_get_format_properties(pdev, format, pFormatProperties);
+
+#ifdef HAVE_ASB_DRM
+   const VkFormatFeatureFlags features =
+      pFormatProperties->formatProperties.optimalTilingFeatures &
+      ~VK_FORMAT_FEATURE_DISJOINT_BIT;
+   const bool asb = (pdev->asb_gpu.capabilities & ASB_DRM_GPU_CAP_MODIFIERS) &&
+                   dzn_asb_format_supported(pdev, format) && features;
+   vk_foreach_struct(ext, pFormatProperties->pNext) {
+      switch (ext->sType) {
+      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT: {
+         VkDrmFormatModifierPropertiesListEXT *list = (void *)ext;
+         VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out,
+                                list->pDrmFormatModifierProperties,
+                                &list->drmFormatModifierCount);
+         if (asb) {
+            vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out, mod) {
+               mod->drmFormatModifier = ASB_DRM_FORMAT_MOD_D3D12;
+               mod->drmFormatModifierPlaneCount = 1;
+               mod->drmFormatModifierTilingFeatures = features;
+            }
+         }
+         break;
+      }
+      case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT: {
+         VkDrmFormatModifierPropertiesList2EXT *list = (void *)ext;
+         VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out,
+                                list->pDrmFormatModifierProperties,
+                                &list->drmFormatModifierCount);
+         if (asb) {
+            vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out, mod) {
+               mod->drmFormatModifier = ASB_DRM_FORMAT_MOD_D3D12;
+               mod->drmFormatModifierPlaneCount = 1;
+               mod->drmFormatModifierTilingFeatures = features;
+            }
+         }
+         break;
+      }
+      default:
+         break;
+      }
+   }
+#endif
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1890,6 +2103,9 @@ dzn_instance_create(const VkInstanceCreateInfo *pCreateInfo,
       d3d12_enable_gpu_validation(instance->d3d12_mod, instance->factory);
 
    instance->sync_binary_type = vk_sync_binary_get_type(&dzn_sync_type);
+#ifndef _WIN32
+   dzn_sync_binary_type_init(&instance->sync_binary_type);
+#endif
    dzn_init_dri_config(instance);
 
    if (instance->drirc.debug.disable) {
@@ -2066,6 +2282,19 @@ dzn_queue_submit(struct vk_queue *q,
          return result;
    }
 
+#ifdef HAVE_ASB_DRM
+   bool external_access = false;
+   for (uint32_t i = 0; i < info->command_buffer_count; i++) {
+      struct dzn_cmd_buffer *cmd_buffer =
+         container_of(info->command_buffers[i], struct dzn_cmd_buffer, vk);
+      util_dynarray_foreach(&cmd_buffer->external_access, struct dzn_cmd_external_access, access) {
+         external_access = true;
+         if (!access->release && !asb_drm_dma_buf_wait(access->dma_buf_fd, true))
+            return vk_queue_set_lost(&queue->vk, "ASB dma-buf acquire failed");
+      }
+   }
+#endif
+
    ID3D12CommandList **cmdlists = alloca(info->command_buffer_count * sizeof(ID3D12CommandList*));
 
    for (uint32_t i = 0; i < info->command_buffer_count; i++) {
@@ -2119,6 +2348,25 @@ dzn_queue_submit(struct vk_queue *q,
 
    if (FAILED(ID3D12CommandQueue_Signal(queue->cmdqueue, queue->fence, ++queue->fence_point)))
       return vk_error(device, VK_ERROR_UNKNOWN);
+
+#ifdef HAVE_ASB_DRM
+   if (external_access && queue->asb_bridge) {
+      int sync_fd = asb_drm_export_fence(queue->asb_bridge, queue->fence_point);
+      if (sync_fd < 0)
+         return vk_queue_set_lost(&queue->vk, "ASB dma-buf fence export failed");
+      for (uint32_t i = 0; i < info->command_buffer_count; i++) {
+         struct dzn_cmd_buffer *cmd_buffer =
+            container_of(info->command_buffers[i], struct dzn_cmd_buffer, vk);
+         util_dynarray_foreach(&cmd_buffer->external_access, struct dzn_cmd_external_access, access) {
+            if (!asb_drm_dma_buf_set_fence(access->dma_buf_fd, sync_fd, true)) {
+               close(sync_fd);
+               return vk_queue_set_lost(&queue->vk, "ASB dma-buf fence import failed");
+            }
+         }
+      }
+      close(sync_fd);
+   }
+#endif
 
    return VK_SUCCESS;
 }
@@ -2265,6 +2513,10 @@ dzn_device_destroy(struct dzn_device *device, const VkAllocationCallbacks *pAllo
 
       dzn_queue_finish(queue);
    }
+
+#ifndef _WIN32
+   dzn_sync_device_finish(device);
+#endif
 
 #ifdef HAVE_ASB_DRM
    asb_drm_bridge_destroy(device->asb_bridge);
@@ -2507,6 +2759,7 @@ dzn_device_create(struct dzn_physical_device *pdev,
    device->support_static_samplers = true;
    device->bindless = (instance->debug_flags & DZN_DEBUG_BINDLESS) != 0 ||
       device->vk.enabled_features.descriptorIndexing ||
+      device->vk.enabled_features.samplerYcbcrConversion ||
       device->vk.enabled_extensions.EXT_descriptor_indexing ||
       device->vk.enabled_features.bufferDeviceAddress ||
       device->vk.enabled_extensions.EXT_buffer_device_address;
@@ -2530,6 +2783,13 @@ dzn_device_create(struct dzn_physical_device *pdev,
    }
 
    assert(queue_count == qindex);
+#ifndef _WIN32
+   result = dzn_sync_device_init(device);
+   if (result != VK_SUCCESS) {
+      dzn_device_destroy(device, pAllocator);
+      return result;
+   }
+#endif
    *out = dzn_device_to_handle(device);
    return VK_SUCCESS;
 }
@@ -2645,6 +2905,8 @@ dzn_device_memory_destroy(struct dzn_device_memory *mem,
 
 #ifdef HAVE_ASB_DRM
    asb_drm_buffer_destroy(mem->asb_buffer);
+   if (mem->asb_dma_buf_fd >= 0)
+      close(mem->asb_dma_buf_fd);
 #endif
 
 #ifdef _WIN32
@@ -2693,6 +2955,10 @@ dzn_device_memory_create(struct dzn_device *device,
 
    VkExternalMemoryHandleTypeFlags export_flags = 0;
    HANDLE import_handle = NULL;
+#ifdef HAVE_ASB_DRM
+   int dma_buf_fd = -1;
+   struct asb_drm_image dma_buf_image = {.fd = -1};
+#endif
    bool imported_from_d3d11 = false;
    void *host_pointer = NULL;
 #ifdef _WIN32
@@ -2745,6 +3011,13 @@ dzn_device_memory_create(struct dzn_device *device,
          case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT:
          case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT:
             break;
+#ifdef HAVE_ASB_DRM
+         case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+            if (!device->asb_bridge)
+               return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+            dma_buf_fd = imp->fd;
+            break;
+#endif
          default:
             return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
          }
@@ -2766,6 +3039,27 @@ dzn_device_memory_create(struct dzn_device *device,
          break;
       }
    }
+
+#ifdef HAVE_ASB_DRM
+   if (dma_buf_fd >= 0) {
+      if (!image || image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
+          !image->asb_pitch ||
+          !asb_drm_import_image(device->asb_bridge, dma_buf_fd, &dma_buf_image))
+         return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      if (dma_buf_image.width != image->desc.Width ||
+          dma_buf_image.height != image->desc.Height ||
+          !asb_drm_format_compatible(
+             asb_drm_format(pdevice->asb_gpu.capabilities,
+                            vk_format_to_pipe_format(image->vk.format)),
+             dma_buf_image.format) ||
+          (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+           dma_buf_image.pitch != image->asb_pitch)) {
+         close(dma_buf_image.fd);
+         return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      }
+      import_handle = (HANDLE)(intptr_t)dma_buf_image.fd;
+   }
+#endif
 
    const VkMemoryType *mem_type =
       &pdevice->memory.memoryTypes[pAllocateInfo->memoryTypeIndex];
@@ -2799,34 +3093,36 @@ dzn_device_memory_create(struct dzn_device *device,
       valid_flags |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
 
 #ifdef HAVE_ASB_DRM
-   bool asb_image = image && pdevice->asb_render_fd >= 0 &&
-      device->asb_bridge &&
-      image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
-      image->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-      image->desc.DepthOrArraySize == 1 && image->desc.MipLevels == 1 &&
-      image->desc.SampleDesc.Count == 1 &&
-      image->desc.Width <= UINT32_MAX / 4 &&
-      (image->vk.format == VK_FORMAT_B8G8R8A8_UNORM ||
-       image->vk.format == VK_FORMAT_B8G8R8A8_SRGB) &&
-      (image->desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-       image->desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-       image->desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS);
+   bool asb_image = image && device->asb_bridge && image->asb_pitch;
    if (asb_image)
       valid_flags |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
 #endif
 
-   if (export_flags & ~valid_flags)
+   if (export_flags & ~valid_flags) {
+#ifdef HAVE_ASB_DRM
+      if (dma_buf_image.fd >= 0)
+         close(dma_buf_image.fd);
+#endif
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   }
 
    struct dzn_device_memory *mem =
       vk_zalloc2(&device->vk.alloc, pAllocator, sizeof(*mem), 8,
                  VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   if (!mem)
+   if (!mem) {
+#ifdef HAVE_ASB_DRM
+      if (dma_buf_image.fd >= 0)
+         close(dma_buf_image.fd);
+#endif
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
 
    vk_object_base_init(&device->vk, &mem->base, VK_OBJECT_TYPE_DEVICE_MEMORY);
 #ifndef _WIN32
    mem->export_handle = (HANDLE)(intptr_t)-1;
+#endif
+#ifdef HAVE_ASB_DRM
+   mem->asb_dma_buf_fd = -1;
 #endif
 
    /* The Vulkan 1.0.33 spec says "allocationSize must be greater than 0". */
@@ -2881,7 +3177,11 @@ dzn_device_memory_create(struct dzn_device *device,
 #else
       goto cleanup;
 #endif
-   } else if (import_handle) {
+   } else if (import_handle
+#ifdef HAVE_ASB_DRM
+              || dma_buf_fd >= 0
+#endif
+   ) {
       error = VK_ERROR_INVALID_EXTERNAL_HANDLE;
       if (image || buffer) {
          if (FAILED(ID3D12Device_OpenSharedHandle(device->dev, import_handle, &IID_ID3D12Resource, (void **)&mem->dedicated_res)))
@@ -2897,12 +3197,24 @@ dzn_device_memory_create(struct dzn_device *device,
 
          /* Don't validate format, cast lists aren't reflectable so it could be valid */
          if (image) {
+            D3D12_RESOURCE_FLAGS ignored_flags = D3D12_RESOURCE_FLAG_NONE;
+#ifdef HAVE_ASB_DRM
+            if (dma_buf_fd >= 0)
+               ignored_flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE |
+                               D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+            if (dma_buf_fd >= 0 &&
+                (dzn_get_typeless_dxgi_format(desc.Format) !=
+                 dzn_get_typeless_dxgi_format(image->desc.Format) ||
+                 ((desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+                  !(image->desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))))
+               goto cleanup;
+#endif
             if (desc.Dimension != image->desc.Dimension ||
                 desc.MipLevels != image->desc.MipLevels ||
                 desc.Width != image->desc.Width ||
                 desc.Height != image->desc.Height ||
                 desc.DepthOrArraySize != image->desc.DepthOrArraySize ||
-                (image->desc.Flags & ~desc.Flags) ||
+                (image->desc.Flags & ~desc.Flags & ~ignored_flags) ||
                 desc.SampleDesc.Count != image->desc.SampleDesc.Count)
                goto cleanup;
          } else if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
@@ -2933,7 +3245,7 @@ dzn_device_memory_create(struct dzn_device *device,
              desc.Properties.MemoryPoolPreference != heap_desc.Properties.MemoryPoolPreference)
             goto cleanup;
       }
-   } else if (image) {
+   } else if (image && !image->plane_descs[0].Width) {
       if (device->dev10 && image->castable_format_count > 0) {
          D3D12_RESOURCE_DESC1 desc = {
             .Dimension = image->desc.Dimension,
@@ -3025,18 +3337,30 @@ dzn_device_memory_create(struct dzn_device *device,
    }
 
 #ifdef HAVE_ASB_DRM
-   if (export_flags & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+   if ((export_flags & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) && dma_buf_fd < 0) {
       const struct asb_drm_image asb_image_info = {
          .fd = (int)(intptr_t)mem->export_handle,
          .width = (uint32_t)image->desc.Width,
          .height = image->desc.Height,
-         .format = DRM_FORMAT_ARGB8888,
-         .pitch = (uint32_t)image->desc.Width * 4,
+         .format = asb_drm_format(pdevice->asb_gpu.capabilities,
+                                  vk_format_to_pipe_format(image->vk.format)),
+         .pitch = image->asb_pitch,
       };
       mem->asb_buffer = asb_drm_buffer_create(device->asb_bridge,
                                               &asb_image_info);
       if (!mem->asb_buffer)
          goto cleanup;
+      mem->asb_dma_buf_fd = asb_drm_buffer_fd(mem->asb_buffer);
+      if (mem->asb_dma_buf_fd < 0)
+         goto cleanup;
+   }
+
+   if (dma_buf_fd >= 0) {
+      close(dma_buf_image.fd);
+      mem->asb_dma_buf_fd = dma_buf_fd;
+      mem->asb_pitch = dma_buf_image.pitch;
+   } else if (asb_image) {
+      mem->asb_pitch = image->asb_pitch;
    }
 #endif
 
@@ -3047,6 +3371,10 @@ cleanup:
 #ifdef _WIN32
    if (handle_from_name)
       CloseHandle(handle_from_name);
+#endif
+#ifdef HAVE_ASB_DRM
+   if (dma_buf_image.fd >= 0)
+      close(dma_buf_image.fd);
 #endif
    dzn_device_memory_destroy(mem, pAllocator);
    return vk_error(device, error);
@@ -3650,6 +3978,12 @@ dzn_sampler_create(struct dzn_device *device,
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vk_object_base_init(&device->vk, &sampler->base, VK_OBJECT_TYPE_SAMPLER);
+   const VkSamplerYcbcrConversionInfo *conversion_info =
+      vk_find_struct_const(pCreateInfo->pNext, SAMPLER_YCBCR_CONVERSION_INFO);
+   if (conversion_info && conversion_info->conversion) {
+      VK_FROM_HANDLE(vk_ycbcr_conversion, conversion, conversion_info->conversion);
+      sampler->ycbcr = conversion->state;
+   }
 
    const VkSamplerCustomBorderColorCreateInfoEXT *pBorderColor = (const VkSamplerCustomBorderColorCreateInfoEXT *)
       vk_find_struct_const(pCreateInfo->pNext, SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT);
@@ -3819,24 +4153,6 @@ dzn_GetImageSparseMemoryRequirements2(VkDevice device,
    *pSparseMemoryRequirementCount = 0;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-dzn_CreateSamplerYcbcrConversion(VkDevice device,
-                                 const VkSamplerYcbcrConversionCreateInfo *pCreateInfo,
-                                 const VkAllocationCallbacks *pAllocator,
-                                 VkSamplerYcbcrConversion *pYcbcrConversion)
-{
-   UNREACHABLE("Ycbcr sampler conversion is not supported");
-   return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-dzn_DestroySamplerYcbcrConversion(VkDevice device,
-                                  VkSamplerYcbcrConversion YcbcrConversion,
-                                  const VkAllocationCallbacks *pAllocator)
-{
-   UNREACHABLE("Ycbcr sampler conversion is not supported");
-}
-
 VKAPI_ATTR VkDeviceAddress VKAPI_CALL
 dzn_GetBufferDeviceAddress(VkDevice device,
                            const VkBufferDeviceAddressInfo* pInfo)
@@ -3891,23 +4207,22 @@ dzn_GetMemoryFdKHR(VkDevice device,
                    int *pFd)
 {
    VK_FROM_HANDLE(dzn_device_memory, mem, pGetFdInfo->memory);
-   if (!mem->export_handle)
+   if ((intptr_t)mem->export_handle < 0)
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    switch (pGetFdInfo->handleType) {
 #ifdef HAVE_ASB_DRM
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
-      if (!mem->asb_buffer)
+      if (mem->asb_dma_buf_fd < 0)
          return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
-      *pFd = asb_drm_buffer_fd(mem->asb_buffer);
+      *pFd = fcntl(mem->asb_dma_buf_fd, F_DUPFD_CLOEXEC, 0);
       return *pFd >= 0 ? VK_SUCCESS : vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 #endif
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT:
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT:
-      *pFd = (int)(intptr_t)mem->export_handle;
-      mem->export_handle = (HANDLE)(intptr_t)-1;
-      return VK_SUCCESS;
+      *pFd = fcntl((int)(intptr_t)mem->export_handle, F_DUPFD_CLOEXEC, 0);
+      return *pFd >= 0 ? VK_SUCCESS : vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    default:
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
@@ -3931,8 +4246,23 @@ dzn_GetMemoryFdPropertiesKHR(VkDevice _device,
    HANDLE handle = (HANDLE)(intptr_t)fd;
 #endif
    VK_FROM_HANDLE(dzn_device, device, _device);
+#ifdef HAVE_ASB_DRM
+   struct asb_drm_image dma_buf_image = {.fd = -1};
+   if (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+      if (!device->asb_bridge ||
+          !asb_drm_import_image(device->asb_bridge, fd, &dma_buf_image))
+         return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      handle = (HANDLE)(intptr_t)dma_buf_image.fd;
+      handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+   }
+#endif
    IUnknown *opened_object;
-   if (FAILED(ID3D12Device_OpenSharedHandle(device->dev, handle, &IID_IUnknown, (void **)&opened_object)))
+   HRESULT opened = ID3D12Device_OpenSharedHandle(device->dev, handle, &IID_IUnknown, (void **)&opened_object);
+#ifdef HAVE_ASB_DRM
+   if (dma_buf_image.fd >= 0)
+      close(dma_buf_image.fd);
+#endif
+   if (FAILED(opened))
       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    VkResult result = VK_ERROR_INVALID_EXTERNAL_HANDLE;

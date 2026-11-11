@@ -13,7 +13,27 @@
 #define ASB_DRM_GPU_CAP_SYNC_FILE 4
 #define ASB_DRM_GPU_CAP_PRESENT 8
 #define ASB_DRM_GPU_CAP_SCANOUT 16
+#define ASB_DRM_GPU_CAP_RESIZE 32
+#define ASB_DRM_GPU_CAP_RGB_FORMATS 64
+#define ASB_DRM_GPU_CAP_MODIFIERS 128
 #define ASB_DRM_GPU_EXPORT_PRIME_FD 1
+
+#ifndef ASB_DRM_FORMAT_MOD_D3D12
+#define ASB_DRM_FORMAT_MOD_D3D12 ((0xa5ULL << 56) | 1)
+#endif
+
+#define ASB_DRM_DISPLAY_GET 0
+#define ASB_DRM_DISPLAY_SET 1
+#define ASB_DRM_DISPLAY_SHARED 1
+#define ASB_DRM_DISPLAY_MATCH_WINDOW 2
+
+struct drm_asb_display_config {
+	__u32 operation;
+	__u32 flags;
+	__u32 width;
+	__u32 height;
+	__u32 refresh;
+};
 
 struct drm_asb_gpu_query {
 	__u32 version;
@@ -81,6 +101,7 @@ struct drm_asb_gpu_acquire {
 #define DRM_ASB_GPU_NATIVE 0x03
 #define DRM_ASB_GPU_PRESENT 0x05
 #define DRM_ASB_GPU_ACQUIRE 0x06
+#define DRM_ASB_DISPLAY_CONFIG 0x07
 
 #define DRM_IOCTL_ASB_GPU_QUERY \
 	DRM_IOR(DRM_COMMAND_BASE + DRM_ASB_GPU_QUERY, struct drm_asb_gpu_query)
@@ -94,5 +115,7 @@ struct drm_asb_gpu_acquire {
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_ASB_GPU_PRESENT, struct drm_asb_gpu_present)
 #define DRM_IOCTL_ASB_GPU_ACQUIRE \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_ASB_GPU_ACQUIRE, struct drm_asb_gpu_acquire)
+#define DRM_IOCTL_ASB_DISPLAY_CONFIG \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_ASB_DISPLAY_CONFIG, struct drm_asb_display_config)
 
 #endif

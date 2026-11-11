@@ -467,11 +467,12 @@ d3d12_is_format_supported(struct pipe_screen *pscreen,
 #ifdef HAVE_ASB_DRM
    if (screen->asb_bridge &&
        (bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET))) {
-      enum pipe_format linear = util_format_linear(format);
       if ((target != PIPE_TEXTURE_2D && target != PIPE_TEXTURE_RECT) ||
           sample_count > 1 || (bind & PIPE_BIND_LINEAR) ||
-          (linear != PIPE_FORMAT_B8G8R8A8_UNORM &&
-           linear != PIPE_FORMAT_B8G8R8X8_UNORM))
+          !asb_drm_bridge_format(screen->asb_bridge, format) ||
+          ((bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)) &&
+           util_format_linear(format) != PIPE_FORMAT_B8G8R8A8_UNORM &&
+           util_format_linear(format) != PIPE_FORMAT_B8G8R8X8_UNORM))
          return false;
    }
 #endif
@@ -592,11 +593,15 @@ d3d12_is_format_supported(struct pipe_screen *pscreen,
       } else
          fmt_info_sv = fmt_info;
 
+      if ((bind & PIPE_BIND_SAMPLER_VIEW) &&
+          !(fmt_info_sv.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD))
+         return false;
+
       if (bind & PIPE_BIND_DEPTH_STENCIL &&
           !(fmt_info.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL))
             return false;
 
-      if (sample_count > 0) {
+      if (sample_count > 1) {
          if (!(fmt_info_sv.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD))
             return false;
 

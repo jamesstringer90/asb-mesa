@@ -63,7 +63,7 @@ load_vulkan_ssbo(nir_builder *b, unsigned buf_idx,
 }
 
 static nir_def *
-lower_deref_to_index(nir_builder *b, nir_deref_instr *deref, bool is_sampler_handle,
+lower_deref_to_index(nir_builder *b, nir_deref_instr *deref, bool is_sampler_handle, unsigned plane,
                      struct dxil_spirv_nir_lower_bindless_options *options)
 {
    nir_variable *var = nir_deref_instr_get_variable(deref);
@@ -85,7 +85,9 @@ lower_deref_to_index(nir_builder *b, nir_deref_instr *deref, bool is_sampler_han
                    remap.binding);
    nir_def *offset = nir_imul_imm(b, index_in_ubo, descriptor_size);
    if (is_sampler_handle)
-      offset = nir_iadd_imm(b, offset, 4);
+      offset = nir_iadd_imm(b, offset, offsetof(struct dxil_spirv_bindless_entry, sampler_idx));
+   else if (plane)
+      offset = nir_iadd_imm(b, offset, offsetof(struct dxil_spirv_bindless_entry, plane_idx) + (plane - 1) * 4);
    return load_vulkan_ssbo(b,
                            var->data.descriptor_set,
                            offset,
@@ -126,7 +128,9 @@ lower_bindless_tex_src(nir_builder *b, nir_tex_instr *tex,
 
    b->cursor = nir_before_instr(&tex->instr);
    nir_deref_instr *deref = nir_src_as_deref(tex->src[index].src);
-   nir_def *handle = lower_deref_to_index(b, deref, is_sampler_handle, options);
+   int plane_src = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+   unsigned plane = plane_src >= 0 ? nir_src_as_uint(tex->src[plane_src].src) : 0;
+   nir_def *handle = lower_deref_to_index(b, deref, is_sampler_handle, plane, options);
    if (!handle)
       return false;
 
@@ -140,6 +144,9 @@ lower_bindless_tex(nir_builder *b, nir_tex_instr *tex, struct dxil_spirv_nir_low
 {
    bool texture = lower_bindless_tex_src(b, tex, nir_tex_src_texture_deref, nir_tex_src_texture_handle, false, options);
    bool sampler = lower_bindless_tex_src(b, tex, nir_tex_src_sampler_deref, nir_tex_src_sampler_handle, true, options);
+   int plane_src = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+   if (texture && plane_src >= 0)
+      nir_tex_instr_remove_src(tex, plane_src);
    return texture || sampler;
 }
 
@@ -148,7 +155,7 @@ lower_bindless_image_intr(nir_builder *b, nir_intrinsic_instr *intr, struct dxil
 {
    b->cursor = nir_before_instr(&intr->instr);
    nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
-   nir_def *handle = lower_deref_to_index(b, deref, false, options);
+   nir_def *handle = lower_deref_to_index(b, deref, false, 0, options);
    if (!handle)
       return false;
 

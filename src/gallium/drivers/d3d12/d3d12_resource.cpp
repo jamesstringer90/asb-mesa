@@ -210,19 +210,6 @@ init_buffer(struct d3d12_screen *screen,
 }
 
 #ifdef HAVE_ASB_DRM
-static uint32_t
-d3d12_asb_format(enum pipe_format format)
-{
-   switch (util_format_linear(format)) {
-   case PIPE_FORMAT_B8G8R8A8_UNORM:
-      return DRM_FORMAT_ARGB8888;
-   case PIPE_FORMAT_B8G8R8X8_UNORM:
-      return DRM_FORMAT_XRGB8888;
-   default:
-      return 0;
-   }
-}
-
 static bool
 d3d12_asb_export_buffer(struct d3d12_screen *screen,
                         struct d3d12_resource *res,
@@ -232,9 +219,11 @@ d3d12_asb_export_buffer(struct d3d12_screen *screen,
    if (res->bo->asb_buffer)
       return true;
    struct pipe_resource *pres = &res->base.b;
-   uint32_t format = imported_format ? imported_format : d3d12_asb_format(pres->format);
+   uint32_t format = imported_format ? imported_format :
+      asb_drm_bridge_format(screen->asb_bridge, pres->format);
    if (!format || pres->last_level || pres->array_size != 1 ||
        pres->nr_samples > 1 ||
+       pres->width0 > UINT32_MAX / util_format_get_blocksize(pres->format) ||
        (pres->target != PIPE_TEXTURE_2D && pres->target != PIPE_TEXTURE_RECT))
       return false;
    HANDLE shared = nullptr;
@@ -246,7 +235,8 @@ d3d12_asb_export_buffer(struct d3d12_screen *screen,
    image.width = pres->width0;
    image.height = pres->height0;
    image.format = format;
-   image.pitch = imported_pitch ? imported_pitch : pres->width0 * 4;
+   image.pitch = imported_pitch ? imported_pitch :
+      util_format_get_stride(pres->format, pres->width0);
    res->bo->asb_buffer = asb_drm_buffer_create(screen->asb_bridge, &image);
    close(image.fd);
    if (res->bo->asb_buffer)
@@ -268,7 +258,7 @@ init_texture(struct d3d12_screen *screen,
    asb_shared = screen->asb_bridge &&
       (templ->bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET));
    if (asb_shared) {
-      if (heap || !d3d12_asb_format(templ->format) || templ->last_level ||
+      if (heap || !asb_drm_bridge_format(screen->asb_bridge, templ->format) || templ->last_level ||
           templ->array_size != 1 || templ->nr_samples > 1 ||
           (templ->bind & PIPE_BIND_LINEAR) ||
           (templ->target != PIPE_TEXTURE_2D && templ->target != PIPE_TEXTURE_RECT))
@@ -673,7 +663,9 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    asb_image.fd = -1;
    if (screen->asb_bridge && handle->type == WINSYS_HANDLE_TYPE_FD) {
       if (handle->offset || handle->plane ||
-          handle->modifier != DRM_FORMAT_MOD_INVALID || (templ && templ->next) ||
+          (handle->modifier != DRM_FORMAT_MOD_INVALID &&
+           handle->modifier != ASB_DRM_FORMAT_MOD_D3D12) ||
+          (templ && templ->next) ||
           !asb_drm_import_image(screen->asb_bridge, handle->handle, &asb_image)) {
          if (res->bo)
             d3d12_bo_unreference(res->bo);
@@ -782,14 +774,17 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    if (asb_image.fd >= 0) {
       const enum pipe_format requested = (enum pipe_format)handle->format;
       const DXGI_FORMAT dxgi = incoming_res_desc.Format;
-      asb_opaque_alias = asb_image.format == DRM_FORMAT_ARGB8888 &&
-         d3d12_asb_format(requested) == DRM_FORMAT_XRGB8888 &&
-         templ && d3d12_asb_format(templ->format) == DRM_FORMAT_XRGB8888 &&
-         (dxgi == DXGI_FORMAT_B8G8R8A8_UNORM ||
-          dxgi == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-          dxgi == DXGI_FORMAT_B8G8R8A8_TYPELESS);
-      if (!asb_opaque_alias &&
-          asb_image.format != d3d12_asb_format(requested))
+      uint32_t format = asb_drm_bridge_format(screen->asb_bridge, requested);
+      enum pipe_format alpha_format = util_format_rgbx_to_rgba(requested);
+      asb_opaque_alias = templ && alpha_format != requested &&
+         util_format_linear(templ->format) == util_format_linear(requested) &&
+         (dxgi == d3d12_get_format(alpha_format) ||
+          dxgi == d3d12_get_typeless_format(alpha_format));
+      if (!asb_drm_format_compatible(format, asb_image.format) ||
+          incoming_res_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+          incoming_res_desc.MipLevels != 1 || incoming_res_desc.DepthOrArraySize != 1 ||
+          incoming_res_desc.SampleDesc.Count != 1 ||
+          asb_image.pitch < util_format_get_stride(requested, asb_image.width))
          goto invalid;
    }
 #endif
@@ -956,6 +951,8 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
    if (asb_image.fd >= 0 &&
        !d3d12_asb_export_buffer(screen, res, asb_image.format, asb_image.pitch))
       goto invalid;
+   if (asb_image.fd >= 0 && handle->modifier == ASB_DRM_FORMAT_MOD_D3D12)
+      res->bo->asb_explicit_modifier = true;
 #endif
    init_valid_range(res);
 
@@ -999,7 +996,8 @@ d3d12_resource_get_handle(struct pipe_screen *pscreen,
       handle->stride = res->bo->asb_pitch;
       handle->offset = 0;
       handle->format = pres->format;
-      handle->modifier = DRM_FORMAT_MOD_INVALID;
+      handle->modifier = res->bo->asb_explicit_modifier ?
+         ASB_DRM_FORMAT_MOD_D3D12 : DRM_FORMAT_MOD_INVALID;
       return true;
    }
 #endif
@@ -1180,7 +1178,8 @@ d3d12_resource_get_param(struct pipe_screen *pscreen,
          *value = false;
          return true;
       case PIPE_RESOURCE_PARAM_MODIFIER:
-         *value = DRM_FORMAT_MOD_INVALID;
+         *value = res->bo->asb_explicit_modifier ?
+            ASB_DRM_FORMAT_MOD_D3D12 : DRM_FORMAT_MOD_INVALID;
          return true;
       default:
          return false;
@@ -1351,10 +1350,94 @@ d3d12_resource_from_memobj(struct pipe_screen *pscreen,
    return d3d12_resource_from_handle(pscreen, templ, &whandle, 0);
 }
 
+#ifdef HAVE_ASB_DRM
+static bool
+d3d12_asb_modifier_format(struct pipe_screen *pscreen, enum pipe_format format)
+{
+   return asb_drm_bridge_format(d3d12_screen(pscreen)->asb_bridge, format) &&
+          pscreen->is_format_supported(pscreen, format, PIPE_TEXTURE_2D,
+                                       0, 0, PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHARED);
+}
+
+static struct pipe_resource *
+d3d12_resource_create_with_modifiers(struct pipe_screen *pscreen,
+                                     const struct pipe_resource *templ,
+                                     const uint64_t *modifiers,
+                                     int count)
+{
+   struct d3d12_screen *screen = d3d12_screen(pscreen);
+   bool explicit_modifier = false;
+   bool implicit_modifier = false;
+
+   for (int i = 0; i < count; i++) {
+      explicit_modifier |= modifiers[i] == ASB_DRM_FORMAT_MOD_D3D12;
+      implicit_modifier |= modifiers[i] == DRM_FORMAT_MOD_INVALID;
+   }
+   if (!screen->asb_bridge || (templ->bind & PIPE_BIND_LINEAR) ||
+       (!explicit_modifier && !implicit_modifier))
+      return nullptr;
+   if (explicit_modifier && !d3d12_asb_modifier_format(pscreen, templ->format))
+      return nullptr;
+
+   struct pipe_resource shared = *templ;
+   shared.bind |= PIPE_BIND_SHARED;
+   struct pipe_resource *pres = d3d12_resource_create(pscreen, &shared);
+   if (pres && explicit_modifier)
+      d3d12_resource(pres)->bo->asb_explicit_modifier = true;
+   return pres;
+}
+
+static void
+d3d12_query_dmabuf_modifiers(struct pipe_screen *pscreen,
+                             enum pipe_format format, int max,
+                             uint64_t *modifiers, unsigned int *external_only,
+                             int *count)
+{
+   *count = 0;
+   if (!d3d12_asb_modifier_format(pscreen, format))
+      return;
+   if (max > 0) {
+      modifiers[0] = ASB_DRM_FORMAT_MOD_D3D12;
+      if (external_only)
+         external_only[0] = false;
+   }
+   *count = 1;
+}
+
+static bool
+d3d12_is_dmabuf_modifier_supported(struct pipe_screen *pscreen,
+                                   uint64_t modifier, enum pipe_format format,
+                                   bool *external_only)
+{
+   bool supported = (modifier == DRM_FORMAT_MOD_INVALID ||
+                     modifier == ASB_DRM_FORMAT_MOD_D3D12) &&
+                    d3d12_asb_modifier_format(pscreen, format);
+   if (supported && external_only)
+      *external_only = false;
+   return supported;
+}
+
+static unsigned int
+d3d12_get_dmabuf_modifier_planes(struct pipe_screen *pscreen,
+                                 uint64_t modifier, enum pipe_format format)
+{
+   return d3d12_is_dmabuf_modifier_supported(pscreen, modifier, format, nullptr) ? 1 : 0;
+}
+#endif
+
 void
 d3d12_screen_resource_init(struct pipe_screen *pscreen)
 {
    pscreen->resource_create = d3d12_resource_create;
+#ifdef HAVE_ASB_DRM
+   if (asb_drm_bridge_has_modifiers(d3d12_screen(pscreen)->asb_bridge)) {
+      pscreen->resource_create_with_modifiers = d3d12_resource_create_with_modifiers;
+      pscreen->is_dmabuf_format_supported = d3d12_asb_modifier_format;
+      pscreen->query_dmabuf_modifiers = d3d12_query_dmabuf_modifiers;
+      pscreen->is_dmabuf_modifier_supported = d3d12_is_dmabuf_modifier_supported;
+      pscreen->get_dmabuf_modifier_planes = d3d12_get_dmabuf_modifier_planes;
+   }
+#endif
    pscreen->resource_from_handle = d3d12_resource_from_handle;
    pscreen->resource_get_handle = d3d12_resource_get_handle;
    pscreen->resource_destroy = d3d12_resource_destroy;

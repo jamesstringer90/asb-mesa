@@ -65,7 +65,7 @@ dzn_wsi_can_present_on_device(VkPhysicalDevice physical, int fd)
 {
    VK_FROM_HANDLE(dzn_physical_device, pdev, physical);
    uint64_t luid;
-   return asb_drm_query_adapter(fd, &luid) && luid == dzn_asb_adapter_luid(pdev);
+   return asb_drm_query_adapter(fd, &luid, NULL) && luid == dzn_asb_adapter_luid(pdev);
 }
 
 static void
@@ -147,6 +147,8 @@ dzn_wsi_init(struct dzn_physical_device *physical_device)
       asb_drm_open_matching_render_node(dzn_asb_adapter_luid(physical_device),
                                         &physical_device->asb_render_device);
    if (physical_device->asb_render_fd >= 0) {
+      asb_drm_query_adapter(physical_device->asb_render_fd, NULL,
+                            &physical_device->asb_gpu);
       ID3D12Fence *fence = NULL;
       HANDLE handle = (HANDLE)(intptr_t)-1;
       if (SUCCEEDED(ID3D12Device1_CreateFence(physical_device->dev, 0,

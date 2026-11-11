@@ -33,8 +33,8 @@ dzn_image_align_extent(const struct dzn_image *image,
                        VkExtent3D *extent)
 {
    enum pipe_format pfmt = vk_format_to_pipe_format(image->vk.format);
-   uint32_t blkw = util_format_get_blockwidth(pfmt);
-   uint32_t blkh = util_format_get_blockheight(pfmt);
+   uint32_t blkw = vk_format_get_plane_count(image->vk.format) > 1 ? 1 : util_format_get_blockwidth(pfmt);
+   uint32_t blkh = vk_format_get_plane_count(image->vk.format) > 1 ? 1 : util_format_get_blockheight(pfmt);
    uint32_t blkd = util_format_get_blockdepth(pfmt);
 
    assert(util_is_power_of_two_nonzero(blkw) &&
@@ -55,6 +55,10 @@ dzn_image_destroy(struct dzn_image *image,
 
    struct dzn_device *device = container_of(image->vk.base.device, struct dzn_device, vk);
 
+   for (unsigned p = 0; p < ARRAY_SIZE(image->plane_resources); p++) {
+      if (image->plane_resources[p])
+         ID3D12Resource_Release(image->plane_resources[p]);
+   }
    if (image->res)
       ID3D12Resource_Release(image->res);
 
@@ -73,7 +77,8 @@ dzn_image_create(struct dzn_device *device,
    VkFormat *compat_formats = NULL;
    uint32_t compat_format_count = 0;
 
-   if (pdev->options12.RelaxedFormatCastingSupported) {
+   if (pdev->options12.RelaxedFormatCastingSupported &&
+       vk_format_get_plane_count(pCreateInfo->format) == 1) {
       VkResult ret =
          vk_image_create_get_format_list(&device->vk, pCreateInfo, pAllocator,
                                          &compat_formats, &compat_format_count);
@@ -128,6 +133,51 @@ dzn_image_create(struct dzn_device *device,
    }
 
    vk_free2(&device->vk.alloc, pAllocator, compat_formats);
+
+#ifdef HAVE_ASB_DRM
+   image->asb_dma_buf_fd = -1;
+   if (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      if (!(pdev->asb_gpu.capabilities & ASB_DRM_GPU_CAP_MODIFIERS) ||
+          !asb_drm_format(pdev->asb_gpu.capabilities, pfmt)) {
+         dzn_image_destroy(image, pAllocator);
+         return vk_error(device, VK_ERROR_FORMAT_NOT_SUPPORTED);
+      }
+      const VkImageDrmFormatModifierListCreateInfoEXT *mod_list =
+         vk_find_struct_const(pCreateInfo->pNext,
+                              IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+      const VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_explicit =
+         vk_find_struct_const(pCreateInfo->pNext,
+                              IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+      bool supported = false;
+      if (mod_explicit) {
+         const VkSubresourceLayout *plane = mod_explicit->pPlaneLayouts;
+         supported = mod_explicit->drmFormatModifier == ASB_DRM_FORMAT_MOD_D3D12 &&
+                     mod_explicit->drmFormatModifierPlaneCount == 1 &&
+                     plane && plane->offset == 0 &&
+                     plane->rowPitch <= UINT32_MAX &&
+                     plane->rowPitch >= util_format_get_stride(pfmt, image->vk.extent.width) &&
+                     plane->rowPitch % util_format_get_blocksize(pfmt) == 0;
+         if (supported)
+            image->asb_pitch = plane->rowPitch;
+      } else if (mod_list) {
+         for (uint32_t i = 0; i < mod_list->drmFormatModifierCount; i++)
+            supported |= mod_list->pDrmFormatModifiers[i] == ASB_DRM_FORMAT_MOD_D3D12;
+      }
+      if (!supported || pdev->asb_render_fd < 0 ||
+          pCreateInfo->imageType != VK_IMAGE_TYPE_2D ||
+          pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 ||
+          pCreateInfo->samples != VK_SAMPLE_COUNT_1_BIT ||
+          (pCreateInfo->flags & (VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT |
+                                VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                                VK_IMAGE_CREATE_DISJOINT_BIT))) {
+         dzn_image_destroy(image, pAllocator);
+         return vk_error(device, mod_explicit ?
+                         VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT :
+                         VK_ERROR_FORMAT_NOT_SUPPORTED);
+      }
+      image->vk.drm_format_mod = ASB_DRM_FORMAT_MOD_D3D12;
+   }
+#endif
 
    image->valid_access = D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST;
 
@@ -242,7 +292,8 @@ dzn_image_create(struct dzn_device *device,
     * destination. Both operations require the RT or DS cap flags.
     */
    if ((usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
-       image->vk.tiling == VK_IMAGE_TILING_OPTIMAL) {
+       image->vk.tiling != VK_IMAGE_TILING_LINEAR &&
+       vk_format_get_plane_count(image->vk.format) == 1) {
 
       D3D12_FEATURE_DATA_FORMAT_SUPPORT dfmt_info =
          dzn_physical_device_get_format_support(pdev, pCreateInfo->format, pCreateInfo->flags);
@@ -267,17 +318,38 @@ dzn_image_create(struct dzn_device *device,
 
 #ifdef HAVE_ASB_DRM
    if (pdev->asb_render_fd >= 0 &&
-       (image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
-       image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+       ((image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) ||
+        image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) &&
+       image->vk.tiling != VK_IMAGE_TILING_LINEAR &&
        image->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
        image->desc.DepthOrArraySize == 1 && image->desc.MipLevels == 1 &&
        image->desc.SampleDesc.Count == 1 &&
-       image->desc.Width <= UINT32_MAX / 4 &&
-       (image->vk.format == VK_FORMAT_B8G8R8A8_UNORM ||
-        image->vk.format == VK_FORMAT_B8G8R8A8_SRGB))
-      image->asb_pitch = (uint32_t)image->desc.Width * 4;
+       asb_drm_format(pdev->asb_gpu.capabilities, pfmt) &&
+       image->desc.Width <= UINT32_MAX / util_format_get_blocksize(pfmt)) {
+      if (!image->asb_pitch)
+         image->asb_pitch = util_format_get_stride(pfmt, image->vk.extent.width);
+      image->desc.Format = dzn_get_typeless_dxgi_format(image->desc.Format);
+      if (!(image->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+         image->desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+   }
 #endif
 
+   if (image->vk.format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM) {
+      uint64_t offset = 0;
+      for (unsigned p = 0; p < 3; p++) {
+         D3D12_RESOURCE_DESC *desc = p ? &image->plane_descs[p - 1] : &image->desc;
+         if (p) {
+            *desc = image->desc;
+            desc->Width = vk_format_get_plane_width(image->vk.format, p, image->vk.extent.width);
+            desc->Height = vk_format_get_plane_height(image->vk.format, p, image->vk.extent.height);
+         }
+         D3D12_RESOURCE_ALLOCATION_INFO info = dzn_ID3D12Device4_GetResourceAllocationInfo(device->dev, 0, 1, desc);
+         offset = ALIGN_POT(offset, info.Alignment);
+         if (p)
+            image->plane_offsets[p - 1] = offset;
+         offset += info.SizeInBytes;
+      }
+   }
    *out = dzn_image_to_handle(image);
    return VK_SUCCESS;
 }
@@ -297,6 +369,21 @@ dzn_image_get_dxgi_format(const struct dzn_physical_device *pdev,
          return DXGI_FORMAT_UNKNOWN;
    }
 
+   if (vk_format_get_plane_count(format) > 1) {
+      if (aspects && aspects != VK_IMAGE_ASPECT_COLOR_BIT) {
+         unsigned plane = (aspects & VK_IMAGE_ASPECT_PLANE_0_BIT) ? 0 :
+                          (aspects & VK_IMAGE_ASPECT_PLANE_1_BIT) ? 1 : 2;
+         format = vk_format_get_plane_format(format, plane);
+      }
+      switch (format) {
+      case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM: return DXGI_FORMAT_R8_UNORM;
+      case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM: return DXGI_FORMAT_NV12;
+      case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16: return DXGI_FORMAT_P010;
+      case VK_FORMAT_R10X6_UNORM_PACK16: return DXGI_FORMAT_R16_UNORM;
+      case VK_FORMAT_R10X6G10X6_UNORM_2PACK16: return DXGI_FORMAT_R16G16_UNORM;
+      default: return dzn_pipe_to_dxgi_format(vk_format_to_pipe_format(format));
+      }
+   }
    if (!vk_format_is_depth_or_stencil(format))
       return dzn_pipe_to_dxgi_format(pfmt);
 
@@ -382,7 +469,7 @@ dzn_image_get_plane_format(VkFormat format,
    else if (aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT)
       return vk_format_depth_only(format);
    else
-      return format;
+      return vk_format_get_plane_aspect_format(format, aspectMask);
 }
 
 uint32_t
@@ -391,8 +478,7 @@ dzn_image_layers_get_subresource_index(const struct dzn_image *image,
                                        VkImageAspectFlagBits aspect,
                                        uint32_t layer)
 {
-   int planeSlice =
-      aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : 0;
+   unsigned planeSlice = image->plane_descs[0].Width ? 0 : dzn_image_aspect_plane(aspect);
 
    return subres->mipLevel +
           ((subres->baseArrayLayer + layer) * image->desc.MipLevels) +
@@ -405,8 +491,7 @@ dzn_image_range_get_subresource_index(const struct dzn_image *image,
                                       VkImageAspectFlagBits aspect,
                                       uint32_t level, uint32_t layer)
 {
-   int planeSlice =
-      aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : 0;
+   unsigned planeSlice = image->plane_descs[0].Width ? 0 : dzn_image_aspect_plane(aspect);
 
    return subres->baseMipLevel + level +
           ((subres->baseArrayLayer + layer) * image->desc.MipLevels) +
@@ -418,8 +503,7 @@ dzn_image_get_subresource_index(const struct dzn_image *image,
                                 const VkImageSubresource *subres,
                                 VkImageAspectFlagBits aspect)
 {
-   int planeSlice =
-      aspect == VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : 0;
+   unsigned planeSlice = image->plane_descs[0].Width ? 0 : dzn_image_aspect_plane(aspect);
 
    return subres->mipLevel +
           (subres->arrayLayer * image->desc.MipLevels) +
@@ -435,7 +519,7 @@ dzn_image_get_copy_loc(const struct dzn_image *image,
    struct dzn_physical_device *pdev =
       container_of(image->vk.base.device->physical, struct dzn_physical_device, vk);
    D3D12_TEXTURE_COPY_LOCATION loc = {
-      .pResource = image->res,
+      .pResource = dzn_image_plane_resource(image, dzn_image_aspect_plane(aspect)),
    };
 
    assert((subres->aspectMask & aspect) != 0);
@@ -444,8 +528,8 @@ dzn_image_get_copy_loc(const struct dzn_image *image,
       assert((subres->baseArrayLayer + layer) == 0);
       assert(subres->mipLevel == 0);
       enum pipe_format pfmt = vk_format_to_pipe_format(image->vk.format);
-      uint32_t blkw = util_format_get_blockwidth(pfmt);
-      uint32_t blkh = util_format_get_blockheight(pfmt);
+      uint32_t blkw = vk_format_get_plane_count(image->vk.format) > 1 ? 1 : util_format_get_blockwidth(pfmt);
+      uint32_t blkh = vk_format_get_plane_count(image->vk.format) > 1 ? 1 : util_format_get_blockheight(pfmt);
       uint32_t blkd = util_format_get_blockdepth(pfmt);
       loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
       loc.PlacedFootprint.Offset = 0;
@@ -832,6 +916,16 @@ dzn_BindImageMemory2(VkDevice dev,
          assert(pBindInfos[i].memoryOffset == 0);
          image->res = mem->dedicated_res;
          ID3D12Resource_AddRef(image->res);
+#ifdef HAVE_ASB_DRM
+         image->asb_dma_buf_fd = mem->asb_dma_buf_fd;
+         if (mem->asb_pitch)
+            image->asb_pitch = mem->asb_pitch;
+         if (mem->asb_dma_buf_fd >= 0) {
+            D3D12_RESOURCE_DESC desc = dzn_ID3D12Resource_GetDesc(mem->dedicated_res);
+            image->desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+            image->desc.Flags |= desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+         }
+#endif
       } else if (device->dev10 && image->castable_format_count > 0) {
          D3D12_RESOURCE_DESC1 desc = {
             .Dimension = image->desc.Dimension,
@@ -868,6 +962,16 @@ dzn_BindImageMemory2(VkDevice dev,
       }
       if (FAILED(hres))
          return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      if (image->plane_descs[0].Width) {
+         for (unsigned p = 0; p < 2; p++) {
+            hres = ID3D12Device1_CreatePlacedResource(device->dev, mem->heap,
+               bind_info->memoryOffset + image->plane_offsets[p], &image->plane_descs[p],
+               D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource,
+               (void **)&image->plane_resources[p]);
+            if (FAILED(hres))
+               return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         }
+      }
    }
 
    return VK_SUCCESS;
@@ -892,9 +996,10 @@ dzn_GetImageMemoryRequirements2(VkDevice _device,
       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
          VkMemoryDedicatedRequirements *requirements =
             (VkMemoryDedicatedRequirements *)ext;
-         requirements->requiresDedicatedAllocation = image->vk.external_handle_types != 0;
+         requirements->requiresDedicatedAllocation = image->vk.external_handle_types != 0 ||
+            image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
          requirements->prefersDedicatedAllocation = requirements->requiresDedicatedAllocation ||
-            image->vk.tiling == VK_IMAGE_TILING_OPTIMAL;
+            image->vk.tiling != VK_IMAGE_TILING_LINEAR;
          break;
       }
 
@@ -917,6 +1022,11 @@ dzn_GetImageMemoryRequirements2(VkDevice _device,
       info = dzn_ID3D12Device4_GetResourceAllocationInfo(device->dev, 0, 1, &image->desc);
    }
 
+   if (image->plane_descs[0].Width) {
+      D3D12_RESOURCE_ALLOCATION_INFO last =
+         dzn_ID3D12Device4_GetResourceAllocationInfo(device->dev, 0, 1, &image->plane_descs[1]);
+      info.SizeInBytes = image->plane_offsets[1] + last.SizeInBytes;
+   }
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
       .size = info.SizeInBytes,
       .alignment = info.Alignment,
@@ -1016,7 +1126,11 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
    struct dzn_physical_device *pdev =
       container_of(iview->vk.base.device->physical, struct dzn_physical_device, vk);
    uint32_t plane_slice = (iview->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) ==
-      VK_IMAGE_ASPECT_STENCIL_BIT ? 1 : 0;
+      VK_IMAGE_ASPECT_STENCIL_BIT || iview->vk.aspects == VK_IMAGE_ASPECT_PLANE_1_BIT ? 1 :
+      iview->vk.aspects == VK_IMAGE_ASPECT_PLANE_2_BIT ? 2 : 0;
+   const struct dzn_image *image = container_of(iview->vk.image, struct dzn_image, vk);
+   if (image->plane_descs[0].Width)
+      plane_slice = 0;
    bool ms = iview->vk.image->samples > 1;
    uint32_t layers_per_elem =
       (iview->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
@@ -1030,7 +1144,8 @@ dzn_image_view_prepare_srv_desc(struct dzn_image_view *iview)
       .Format =
          dzn_image_get_dxgi_format(pdev, iview->vk.format,
                                    iview->vk.usage & ~VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                                   iview->vk.aspects),
+                                   vk_format_get_plane_count(iview->vk.format) > 1 ?
+                                   VK_IMAGE_ASPECT_PLANE_0_BIT : iview->vk.aspects),
    };
 
    D3D12_SHADER_COMPONENT_MAPPING swz[] = {
@@ -1413,6 +1528,8 @@ dzn_image_view_destroy(struct dzn_image_view *iview,
 
    struct dzn_device *device = container_of(iview->vk.base.device, struct dzn_device, vk);
 
+   for (unsigned p = 0; p < ARRAY_SIZE(iview->plane_bindless_slots); p++)
+      dzn_device_descriptor_heap_free_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, iview->plane_bindless_slots[p]);
    dzn_device_descriptor_heap_free_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, iview->srv_bindless_slot);
    dzn_device_descriptor_heap_free_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, iview->uav_bindless_slot);
 
@@ -1436,6 +1553,8 @@ dzn_image_view_create(struct dzn_device *device,
    dzn_image_view_init(device, iview, pCreateInfo);
 
    iview->srv_bindless_slot = iview->uav_bindless_slot = -1;
+   for (unsigned p = 0; p < ARRAY_SIZE(iview->plane_bindless_slots); p++)
+      iview->plane_bindless_slots[p] = -1;
    if (device->bindless) {
       if (!(image->desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) {
          iview->srv_bindless_slot = dzn_device_descriptor_heap_alloc_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1449,6 +1568,26 @@ dzn_image_view_create(struct dzn_device *device,
                                                    iview->srv_bindless_slot,
                                                    false, false,
                                                    iview);
+      }
+      for (unsigned p = 1; p < vk_format_get_plane_count(iview->vk.format); p++) {
+         int slot = dzn_device_descriptor_heap_alloc_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+         if (slot < 0) {
+            dzn_image_view_destroy(iview, pAllocator);
+            return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         }
+         iview->plane_bindless_slots[p - 1] = slot;
+         D3D12_SHADER_RESOURCE_VIEW_DESC desc = iview->srv_desc;
+         struct dzn_physical_device *pdev =
+            container_of(device->vk.physical, struct dzn_physical_device, vk);
+         desc.Format = dzn_image_get_dxgi_format(pdev, iview->vk.format,
+                                                VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                VK_IMAGE_ASPECT_PLANE_0_BIT << p);
+         if (desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
+            desc.Texture2DArray.PlaneSlice = image->plane_descs[0].Width ? 0 : p;
+         else
+            desc.Texture2D.PlaneSlice = image->plane_descs[0].Width ? 0 : p;
+         ID3D12Device1_CreateShaderResourceView(device->dev, dzn_image_plane_resource(image, p), &desc,
+            dzn_descriptor_heap_get_cpu_handle(&device->device_heaps[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].heap, slot));
       }
       if (iview->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
          iview->uav_bindless_slot = dzn_device_descriptor_heap_alloc_slot(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);

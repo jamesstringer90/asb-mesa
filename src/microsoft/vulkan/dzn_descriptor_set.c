@@ -185,7 +185,7 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
           immutable_samplers && bindings[i].descriptorCount == 1) {
          VK_FROM_HANDLE(dzn_sampler, sampler, bindings[i].pImmutableSamplers[0]);
 
-         if (sampler->static_border_color != -1)
+         if (sampler->static_border_color != -1 && sampler->ycbcr.format == VK_FORMAT_UNDEFINED)
             static_sampler = true;
       }
 
@@ -236,6 +236,8 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
                       static_sampler_count);
    VK_MULTIALLOC_DECL(&ma, const struct dzn_sampler *, immutable_samplers,
                       immutable_sampler_count);
+   VK_MULTIALLOC_DECL(&ma, struct vk_ycbcr_conversion_state, immutable_ycbcr,
+                      immutable_sampler_count);
    VK_MULTIALLOC_DECL(&ma, struct dzn_descriptor_set_layout_binding, binfos,
                       binding_count);
 
@@ -245,6 +247,7 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
    set_layout->static_samplers = static_samplers;
    set_layout->static_sampler_count = static_sampler_count;
    set_layout->immutable_samplers = immutable_samplers;
+   set_layout->immutable_ycbcr = immutable_ycbcr;
    set_layout->immutable_sampler_count = immutable_sampler_count;
    set_layout->bindings = binfos;
    set_layout->binding_count = binding_count;
@@ -323,7 +326,7 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
          VK_FROM_HANDLE(dzn_sampler, sampler, ordered_bindings[i].pImmutableSamplers[0]);
 
          /* Not all border colors are supported. */
-         if (sampler->static_border_color != -1) {
+         if (sampler->static_border_color != -1 && sampler->ycbcr.format == VK_FORMAT_UNDEFINED) {
             D3D12_STATIC_SAMPLER_DESC1 *desc = (D3D12_STATIC_SAMPLER_DESC1 *)
                &static_samplers[static_sampler_idx];
 
@@ -360,6 +363,7 @@ dzn_descriptor_set_layout_create(struct dzn_device *device,
          for (uint32_t s = 0; s < desc_count; s++) {
             VK_FROM_HANDLE(dzn_sampler, sampler, ordered_bindings[i].pImmutableSamplers[s]);
 
+            immutable_ycbcr[immutable_sampler_idx] = sampler->ycbcr;
             immutable_samplers[immutable_sampler_idx++] = sampler;
          }
       }
@@ -608,6 +612,11 @@ dzn_pipeline_layout_hash_stages(struct dzn_pipeline_layout *layout,
             _mesa_blake3_update(&ctx, &set_layout->bindings[b].base_shader_register,
                               sizeof(set_layout->bindings[b].base_shader_register));
          }
+      }
+      for (uint32_t set = 0; set < info->setLayoutCount; set++) {
+         VK_FROM_HANDLE(dzn_descriptor_set_layout, set_layout, info->pSetLayouts[set]);
+         _mesa_blake3_update(&ctx, set_layout->immutable_ycbcr,
+                            set_layout->immutable_sampler_count * sizeof(*set_layout->immutable_ycbcr));
       }
       _mesa_blake3_final(&ctx, layout->stages[stage].hash);
    }
@@ -1027,7 +1036,7 @@ dzn_descriptor_heap_write_image_view_desc(struct dzn_device *device,
 
       ID3D12Device1_CreateShaderResourceView(device->dev, image->res, &srv_desc, view_handle);
    } else {
-      ID3D12Device1_CreateShaderResourceView(device->dev, image->res, &iview->srv_desc, view_handle);
+      ID3D12Device1_CreateShaderResourceView(device->dev, dzn_image_plane_resource(image, dzn_image_aspect_plane(iview->vk.aspects)), &iview->srv_desc, view_handle);
    }
 }
 
@@ -1118,6 +1127,8 @@ dzn_bindless_descriptor_set_write_image_view_desc(volatile struct dxil_spirv_bin
    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
       map[desc_offset].texture_idx = iview->srv_bindless_slot;
+      for (unsigned p = 0; p < ARRAY_SIZE(iview->plane_bindless_slots); p++)
+         map[desc_offset].plane_idx[p] = iview->plane_bindless_slots[p];
       break;
    default:
       UNREACHABLE("Unexpected descriptor type");
@@ -1680,7 +1691,8 @@ dzn_descriptor_set_init(struct dzn_descriptor_set *set,
       dzn_foreach_pool_type(type) {
          set->heap_offsets[type] = pool->free_offset[type];
          if (device->bindless)
-            set->heap_offsets[type] = align(set->heap_offsets[type], 2);
+            set->heap_offsets[type] = align(set->heap_offsets[type],
+               DIV_ROUND_UP(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT, sizeof(struct dxil_spirv_bindless_entry)));
          set->heap_sizes[type] = layout->range_desc_count[type] + variable_descriptor_count[type];
          set->pool->free_offset[type] = set->heap_offsets[type] + set->heap_sizes[type];
       }
@@ -1801,12 +1813,6 @@ dzn_descriptor_pool_create(struct dzn_device *device,
 
    if (device->bindless) {
       if (pool->desc_count[0]) {
-         /* Include extra descriptors so that we can align each allocated descriptor set to a 16-byte boundary */
-         static_assert(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT / sizeof(struct dxil_spirv_bindless_entry) == 2,
-                       "Ensure only one extra descriptor is needed to produce correct alignments");
-         uint32_t extra_descriptors = pool->set_count - 1;
-         pool->desc_count[0] += extra_descriptors;
-
          /* Going to raw APIs to avoid allocating descriptors for this */
          D3D12_RESOURCE_DESC buf_desc = {
             .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -2136,7 +2142,7 @@ dzn_descriptor_set_write(struct dzn_device *device,
          const VkDescriptorImageInfo *pImageInfo = pDescriptorWrite->pImageInfo + d;
          VK_FROM_HANDLE(dzn_sampler, sampler, pImageInfo->sampler);
 
-         if (sampler)
+         if (sampler && set->layout->bindings[ptr.binding].immutable_sampler_idx == ~0)
             dzn_descriptor_set_ptr_write_sampler_desc(device, set, &ptr, sampler);
 
          d++;
@@ -2150,7 +2156,7 @@ dzn_descriptor_set_write(struct dzn_device *device,
          VK_FROM_HANDLE(dzn_sampler, sampler, pImageInfo->sampler);
          VK_FROM_HANDLE(dzn_image_view, iview, pImageInfo->imageView);
 
-         if (sampler)
+         if (sampler && set->layout->bindings[ptr.binding].immutable_sampler_idx == ~0)
             dzn_descriptor_set_ptr_write_sampler_desc(device, set, &ptr, sampler);
 
          if (iview)

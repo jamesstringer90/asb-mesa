@@ -266,7 +266,7 @@ d3d12_create_drm_screen(int fd)
 {
 #if defined(HAVE_ASB_DRM) && defined(HAVE_DRISW_KMS)
    uint64_t adapter_luid;
-   if (!asb_drm_query_adapter(fd, &adapter_luid))
+   if (!asb_drm_query_adapter(fd, &adapter_luid, nullptr))
       return nullptr;
 
    struct sw_winsys *winsys = kms_dri_create_winsys(fd);

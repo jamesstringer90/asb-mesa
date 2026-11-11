@@ -157,7 +157,8 @@ dzn_cmd_buffer_queue_image_range_state_transition(struct dzn_cmd_buffer *cmdbuf,
    uint32_t first_barrier = 0, barrier_count = 0;
    VkResult ret = VK_SUCCESS;
 
-   dzn_foreach_aspect(aspect, range->aspectMask) {
+   dzn_foreach_aspect(aspect, dzn_image_aspects(image, range->aspectMask)) {
+      barrier_count = 0;
       uint32_t layer_count = dzn_get_layer_count(image, range);
       uint32_t level_count = dzn_get_level_count(image, range);
       for (uint32_t layer = 0; layer < layer_count; layer++) {
@@ -171,7 +172,7 @@ dzn_cmd_buffer_queue_image_range_state_transition(struct dzn_cmd_buffer *cmdbuf,
             continue;
          }
 
-         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, image->res,
+         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, dzn_image_plane_resource(image, dzn_image_aspect_plane(aspect)),
                                                         first_barrier, barrier_count,
                                                         before, after, flags);
          if (ret != VK_SUCCESS)
@@ -181,7 +182,7 @@ dzn_cmd_buffer_queue_image_range_state_transition(struct dzn_cmd_buffer *cmdbuf,
       }
 
       if (barrier_count) {
-         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, image->res,
+         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, dzn_image_plane_resource(image, dzn_image_aspect_plane(aspect)),
                                                         first_barrier, barrier_count,
                                                         before, after, flags);
          if (ret != VK_SUCCESS)
@@ -207,7 +208,8 @@ dzn_cmd_buffer_queue_image_range_layout_transition(struct dzn_cmd_buffer *cmdbuf
    if (old_layout == VK_IMAGE_LAYOUT_UNDEFINED)
       flags |= DZN_QUEUE_TRANSITION_BEFORE_IS_UNDEFINED;
 
-   dzn_foreach_aspect(aspect, range->aspectMask) {
+   dzn_foreach_aspect(aspect, dzn_image_aspects(image, range->aspectMask)) {
+      barrier_count = 0;
       D3D12_RESOURCE_STATES after =
          dzn_image_layout_to_state(image, new_layout, aspect, cmdbuf->type);
       D3D12_RESOURCE_STATES before =
@@ -229,7 +231,7 @@ dzn_cmd_buffer_queue_image_range_layout_transition(struct dzn_cmd_buffer *cmdbuf
             continue;
          }
 
-         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, image->res,
+         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, dzn_image_plane_resource(image, dzn_image_aspect_plane(aspect)),
                                                         first_barrier, barrier_count,
                                                         before, after, flags);
          if (ret != VK_SUCCESS)
@@ -239,7 +241,7 @@ dzn_cmd_buffer_queue_image_range_layout_transition(struct dzn_cmd_buffer *cmdbuf
       }
 
       if (barrier_count) {
-         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, image->res,
+         ret = dzn_cmd_buffer_queue_transition_barriers(cmdbuf, dzn_image_plane_resource(image, dzn_image_aspect_plane(aspect)),
                                                         first_barrier, barrier_count,
                                                         before, after, flags);
          if (ret != VK_SUCCESS)
@@ -310,8 +312,25 @@ dzn_cmd_buffer_image_barrier(struct dzn_cmd_buffer *cmdbuf,
                              const VkImageSubresourceRange *range)
 {
    assert(cmdbuf->enhanced_barriers);
-   uint32_t first_plane = (range->aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT) ? 1 : 0;
-   uint32_t plane_count = first_plane == 0 && (range->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) ? 2 : 1;
+   VkImageAspectFlags aspects = dzn_image_aspects(image, range->aspectMask);
+   if (image->plane_descs[0].Width) {
+      dzn_foreach_aspect(aspect, aspects) {
+         struct dzn_image plane = *image;
+         unsigned p = dzn_image_aspect_plane(aspect);
+         plane.res = dzn_image_plane_resource(image, p);
+         if (p)
+            plane.desc = image->plane_descs[p - 1];
+         plane.plane_descs[0].Width = 0;
+         plane.vk.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+         VkImageSubresourceRange plane_range = *range;
+         plane_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+         dzn_cmd_buffer_image_barrier(cmdbuf, &plane, sync_before, sync_after,
+            access_before, access_after, layout_before, layout_after, &plane_range);
+      }
+      return;
+   }
+   uint32_t first_plane = dzn_image_aspect_plane(aspects);
+   uint32_t plane_count = util_bitcount(aspects);
    D3D12_TEXTURE_BARRIER texture = {
       .SyncBefore = sync_before,
       .SyncAfter = sync_after,
@@ -416,6 +435,9 @@ dzn_cmd_buffer_destroy(struct vk_command_buffer *cbuf)
    util_dynarray_fini(&cmdbuf->events.signal);
    util_dynarray_fini(&cmdbuf->queries.reset);
    util_dynarray_fini(&cmdbuf->queries.signal);
+#ifdef HAVE_ASB_DRM
+   util_dynarray_fini(&cmdbuf->external_access);
+#endif
 
    if (cmdbuf->rtvs.ht) {
       hash_table_foreach(cmdbuf->rtvs.ht, he)
@@ -477,6 +499,9 @@ dzn_cmd_buffer_reset(struct vk_command_buffer *cbuf, VkCommandBufferResetFlags f
    util_dynarray_clear(&cmdbuf->events.signal);
    util_dynarray_clear(&cmdbuf->queries.reset);
    util_dynarray_clear(&cmdbuf->queries.signal);
+#ifdef HAVE_ASB_DRM
+   util_dynarray_clear(&cmdbuf->external_access);
+#endif
    hash_table_foreach(cmdbuf->rtvs.ht, he)
       vk_free(&cmdbuf->vk.pool->alloc, he->data);
    _mesa_hash_table_clear(cmdbuf->rtvs.ht, NULL);
@@ -618,6 +643,9 @@ dzn_cmd_buffer_create(const VkCommandBufferAllocateInfo *info,
    cmdbuf->events.signal = UTIL_DYNARRAY_INIT;
    cmdbuf->queries.reset = UTIL_DYNARRAY_INIT;
    cmdbuf->queries.signal = UTIL_DYNARRAY_INIT;
+#ifdef HAVE_ASB_DRM
+   cmdbuf->external_access = UTIL_DYNARRAY_INIT;
+#endif
    dzn_descriptor_heap_pool_init(&cmdbuf->rtvs.pool, device,
                                  D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                                  false, &pool->alloc);
@@ -1085,11 +1113,49 @@ dzn_EndCommandBuffer(VkCommandBuffer commandBuffer)
    return vk_command_buffer_end(&cmdbuf->vk);
 }
 
+#ifdef HAVE_ASB_DRM
+static bool
+dzn_queue_family_is_external(uint32_t family)
+{
+   return family == VK_QUEUE_FAMILY_FOREIGN_EXT ||
+          family == VK_QUEUE_FAMILY_EXTERNAL;
+}
+#endif
+
+static void
+dzn_cmd_buffer_track_external_access(struct dzn_cmd_buffer *cmdbuf,
+                                     const VkImageMemoryBarrier2 *barrier)
+{
+#ifdef HAVE_ASB_DRM
+   VK_FROM_HANDLE(dzn_image, image, barrier->image);
+   if (!image || image->asb_dma_buf_fd < 0 ||
+       barrier->srcQueueFamilyIndex == barrier->dstQueueFamilyIndex)
+      return;
+   bool acquire = dzn_queue_family_is_external(barrier->srcQueueFamilyIndex);
+   bool release = dzn_queue_family_is_external(barrier->dstQueueFamilyIndex);
+   if (acquire == release)
+      return;
+   struct dzn_cmd_external_access *access =
+      util_dynarray_grow(&cmdbuf->external_access, struct dzn_cmd_external_access, 1);
+   if (!access) {
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   *access = (struct dzn_cmd_external_access) {
+      .dma_buf_fd = image->asb_dma_buf_fd,
+      .release = release,
+   };
+#endif
+}
+
 VKAPI_ATTR void VKAPI_CALL
 dzn_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                         const VkDependencyInfo *info)
 {
    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
+
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++)
+      dzn_cmd_buffer_track_external_access(cmdbuf, &info->pImageMemoryBarriers[i]);
 
    bool execution_barrier =
       !info->memoryBarrierCount &&
@@ -1463,6 +1529,9 @@ dzn_CmdPipelineBarrier2_enhanced(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
 
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++)
+      dzn_cmd_buffer_track_external_access(cmdbuf, &info->pImageMemoryBarriers[i]);
+
    uint32_t num_barrier_groups = 0;
    D3D12_BARRIER_GROUP groups[3];
 
@@ -1480,7 +1549,9 @@ dzn_CmdPipelineBarrier2_enhanced(VkCommandBuffer commandBuffer,
       if (image->vk.tiling == VK_IMAGE_TILING_LINEAR)
          ++num_buffer_barriers;
       else
-         num_image_barriers += need_separate_aspect_barriers ? 2 : 1;
+         num_image_barriers += image->plane_descs[0].Width ?
+            util_bitcount(dzn_image_aspects(image, info->pImageMemoryBarriers[i].subresourceRange.aspectMask)) :
+            need_separate_aspect_barriers ? 2 : 1;
    }
 
    VK_MULTIALLOC(ma);
@@ -1593,10 +1664,15 @@ dzn_CmdPipelineBarrier2_enhanced(VkCommandBuffer commandBuffer,
       uint32_t num_aspects = need_separate_aspect_barriers ? 2 : 1;
       VkImageAspectFlags aspect_0_mask = need_separate_aspect_barriers ?
          (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_FLAG_BITS_MAX_ENUM;
-      VkImageAspectFlags aspects[] = {
-         range->aspectMask & aspect_0_mask,
+      VkImageAspectFlags aspects[3] = {
+         dzn_image_aspects(image, range->aspectMask) & aspect_0_mask,
          range->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT,
       };
+      if (image->plane_descs[0].Width) {
+         num_aspects = 0;
+         dzn_foreach_aspect(plane, dzn_image_aspects(image, range->aspectMask))
+            aspects[num_aspects++] = plane;
+      }
 
       for (uint32_t aspect_idx = 0; aspect_idx < num_aspects; ++aspect_idx) {
          VkImageAspectFlags aspect = aspects[aspect_idx];
@@ -1651,9 +1727,9 @@ dzn_CmdPipelineBarrier2_enhanced(VkCommandBuffer commandBuffer,
          texture_barriers[tbar].Subresources.NumArraySlices = dzn_get_layer_count(image, range);
          texture_barriers[tbar].Subresources.IndexOrFirstMipLevel = range->baseMipLevel;
          texture_barriers[tbar].Subresources.NumMipLevels = dzn_get_level_count(image, range);
-         texture_barriers[tbar].Subresources.FirstPlane = aspect_idx;
+         texture_barriers[tbar].Subresources.FirstPlane = image->plane_descs[0].Width ? 0 : dzn_image_aspect_plane(aspect);
          texture_barriers[tbar].Subresources.NumPlanes = util_bitcount(aspect);
-         texture_barriers[tbar].pResource = image->res;
+         texture_barriers[tbar].pResource = dzn_image_plane_resource(image, dzn_image_aspect_plane(aspect));
          texture_barriers[tbar].Flags = D3D12_TEXTURE_BARRIER_FLAG_NONE;
          if (texture_barriers[tbar].LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED)
             texture_barriers[tbar].Flags |= D3D12_TEXTURE_BARRIER_FLAG_DISCARD;
@@ -2396,7 +2472,7 @@ dzn_cmd_buffer_copy_buf2img_region(struct dzn_cmd_buffer *cmdbuf,
    ID3D12GraphicsCommandList1 *cmdlist = cmdbuf->cmdlist;
 
    VkBufferImageCopy2 region = info->pRegions[r];
-   enum pipe_format pfmt = vk_format_to_pipe_format(dst_image->vk.format);
+   enum pipe_format pfmt = vk_format_to_pipe_format(dzn_image_get_plane_format(dst_image->vk.format, aspect));
    uint32_t blkh = util_format_get_blockheight(pfmt);
    uint32_t blkd = util_format_get_blockdepth(pfmt);
 
@@ -2477,7 +2553,7 @@ dzn_cmd_buffer_copy_img2buf_region(struct dzn_cmd_buffer *cmdbuf,
    ID3D12GraphicsCommandList1 *cmdlist = cmdbuf->cmdlist;
 
    VkBufferImageCopy2 region = info->pRegions[r];
-   enum pipe_format pfmt = vk_format_to_pipe_format(src_image->vk.format);
+   enum pipe_format pfmt = vk_format_to_pipe_format(dzn_image_get_plane_format(src_image->vk.format, aspect));
    uint32_t blkh = util_format_get_blockheight(pfmt);
    uint32_t blkd = util_format_get_blockdepth(pfmt);
 
@@ -2563,10 +2639,12 @@ dzn_cmd_buffer_copy_img_chunk(struct dzn_cmd_buffer *cmdbuf,
 
    const VkImageSubresourceLayers *src_subres = &region.srcSubresource;
    const VkImageSubresourceLayers *dst_subres = &region.dstSubresource;
+   VkImageAspectFlagBits dst_aspect = util_bitcount(dst_subres->aspectMask) == 1 ?
+      (VkImageAspectFlagBits)dst_subres->aspectMask : aspect;
    VkFormat src_format =
       dzn_image_get_plane_format(src->vk.format, aspect);
    VkFormat dst_format =
-      dzn_image_get_plane_format(dst->vk.format, aspect);
+      dzn_image_get_plane_format(dst->vk.format, dst_aspect);
 
    enum pipe_format src_pfmt = vk_format_to_pipe_format(src_format);
    uint32_t src_blkw = util_format_get_blockwidth(src_pfmt);
@@ -2580,7 +2658,6 @@ dzn_cmd_buffer_copy_img_chunk(struct dzn_cmd_buffer *cmdbuf,
    uint32_t depth = region.extent.depth;
    uint32_t dst_l = l, src_l = l;
 
-   assert(src_subres->aspectMask == dst_subres->aspectMask);
 
    if (src->vk.image_type == VK_IMAGE_TYPE_3D &&
        dst->vk.image_type == VK_IMAGE_TYPE_2D) {
@@ -2598,8 +2675,15 @@ dzn_cmd_buffer_copy_img_chunk(struct dzn_cmd_buffer *cmdbuf,
       assert(src_subres->layerCount == dst_subres->layerCount);
    }
 
-   D3D12_TEXTURE_COPY_LOCATION dst_loc = dzn_image_get_copy_loc(dst, dst_subres, aspect, dst_l);
+   D3D12_TEXTURE_COPY_LOCATION dst_loc = dzn_image_get_copy_loc(dst, dst_subres, dst_aspect, dst_l);
    D3D12_TEXTURE_COPY_LOCATION src_loc = dzn_image_get_copy_loc(src, src_subres, aspect, src_l);
+
+   if (src->vk.tiling == VK_IMAGE_TILING_LINEAR && vk_format_get_plane_count(dst->vk.format) > 1)
+      src_loc.PlacedFootprint.Footprint.Format =
+         dzn_image_get_placed_footprint_format(pdev, dst->vk.format, dst_aspect);
+   if (dst->vk.tiling == VK_IMAGE_TILING_LINEAR && vk_format_get_plane_count(src->vk.format) > 1)
+      dst_loc.PlacedFootprint.Footprint.Format =
+         dzn_image_get_placed_footprint_format(pdev, src->vk.format, aspect);
 
    D3D12_BOX src_box = {
       .left = (UINT)MAX2(region.srcOffset.x, 0),
@@ -2658,7 +2742,7 @@ dzn_cmd_buffer_copy_img_chunk(struct dzn_cmd_buffer *cmdbuf,
    }
 
    tmp_desc->Format =
-      dzn_image_get_placed_footprint_format(pdev, dst->vk.format, aspect);
+      dzn_image_get_placed_footprint_format(pdev, dst->vk.format, dst_aspect);
    if (src_blkw != dst_blkw)
       tmp_desc->Width = DIV_ROUND_UP(region.extent.width, src_blkw) * dst_blkw;
    if (src_blkh != dst_blkh)
@@ -4179,9 +4263,11 @@ dzn_CmdCopyImage2(VkCommandBuffer commandBuffer,
       const VkImageCopy2 *region = &info->pRegions[i];
 
       dzn_foreach_aspect(aspect, region->srcSubresource.aspectMask) {
-         assert(aspect & region->dstSubresource.aspectMask);
-
-         if (!dzn_image_formats_are_compatible(device, src->vk.format, dst->vk.format,
+         VkImageAspectFlagBits dst_aspect = util_bitcount(region->dstSubresource.aspectMask) == 1 ?
+            (VkImageAspectFlagBits)region->dstSubresource.aspectMask : aspect;
+         VkFormat src_format = dzn_image_get_plane_format(src->vk.format, aspect);
+         VkFormat dst_format = dzn_image_get_plane_format(dst->vk.format, dst_aspect);
+         if (!dzn_image_formats_are_compatible(device, src_format, dst_format,
                                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT, aspect) &&
              src->vk.tiling != VK_IMAGE_TILING_LINEAR &&
              dst->vk.tiling != VK_IMAGE_TILING_LINEAR) {

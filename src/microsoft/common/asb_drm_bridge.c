@@ -1,6 +1,8 @@
 #include "asb_drm_bridge.h"
 #include "asb_drm_uapi.h"
 #include "d3dkmthk.h"
+#include "drm-uapi/drm_fourcc.h"
+#include "util/format/u_format.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -11,6 +13,7 @@
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -23,6 +26,9 @@ struct asb_drm_bridge {
     uint64_t adapter_luid;
     uint32_t device_handle;
     uint32_t fence_handle;
+    uint32_t capabilities;
+    uint32_t max_width;
+    uint32_t max_height;
     atomic_uint references;
 };
 
@@ -47,7 +53,8 @@ static void asb_drm_close_handle(int fd, uint32_t handle)
     asb_drm_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &close_handle);
 }
 
-bool asb_drm_query_adapter(int fd, uint64_t *adapter_luid)
+bool asb_drm_query_adapter(int fd, uint64_t *adapter_luid,
+                           struct drm_asb_gpu_query *info)
 {
     const uint32_t required = ASB_DRM_GPU_CAP_BUFFER_IMPORT |
                               ASB_DRM_GPU_CAP_NATIVE_HANDLES |
@@ -61,7 +68,83 @@ bool asb_drm_query_adapter(int fd, uint64_t *adapter_luid)
         return false;
     if (adapter_luid)
         *adapter_luid = query.adapter_luid;
+    if (info)
+        *info = query;
     return true;
+}
+
+uint32_t asb_drm_format(uint32_t capabilities, enum pipe_format format)
+{
+    format = util_format_linear(format);
+    if (format == PIPE_FORMAT_B8G8R8A8_UNORM)
+        return DRM_FORMAT_ARGB8888;
+    if (format == PIPE_FORMAT_B8G8R8X8_UNORM)
+        return DRM_FORMAT_XRGB8888;
+    if (!(capabilities & ASB_DRM_GPU_CAP_RGB_FORMATS))
+        return 0;
+
+    switch (format) {
+    case PIPE_FORMAT_R8G8B8A8_UNORM: return DRM_FORMAT_ABGR8888;
+    case PIPE_FORMAT_R8G8B8X8_UNORM: return DRM_FORMAT_XBGR8888;
+    case PIPE_FORMAT_R10G10B10A2_UNORM: return DRM_FORMAT_ABGR2101010;
+    case PIPE_FORMAT_R10G10B10X2_UNORM: return DRM_FORMAT_XBGR2101010;
+    case PIPE_FORMAT_R16G16B16A16_UNORM: return DRM_FORMAT_ABGR16161616;
+    case PIPE_FORMAT_R16G16B16X16_UNORM: return DRM_FORMAT_XBGR16161616;
+    case PIPE_FORMAT_R16G16B16A16_FLOAT: return DRM_FORMAT_ABGR16161616F;
+    case PIPE_FORMAT_R16G16B16X16_FLOAT: return DRM_FORMAT_XBGR16161616F;
+    case PIPE_FORMAT_R32G32B32A32_FLOAT: return DRM_FORMAT_ABGR32323232F;
+    case PIPE_FORMAT_B5G6R5_UNORM: return DRM_FORMAT_RGB565;
+    case PIPE_FORMAT_B5G5R5A1_UNORM: return DRM_FORMAT_ARGB1555;
+    case PIPE_FORMAT_B5G5R5X1_UNORM: return DRM_FORMAT_XRGB1555;
+    case PIPE_FORMAT_B4G4R4A4_UNORM: return DRM_FORMAT_ARGB4444;
+    case PIPE_FORMAT_B4G4R4X4_UNORM: return DRM_FORMAT_XRGB4444;
+    case PIPE_FORMAT_A4B4G4R4_UNORM: return DRM_FORMAT_RGBA4444;
+    case PIPE_FORMAT_R8_UNORM: return DRM_FORMAT_R8;
+    case PIPE_FORMAT_R8G8_UNORM: return DRM_FORMAT_GR88;
+    case PIPE_FORMAT_R16_UNORM: return DRM_FORMAT_R16;
+    case PIPE_FORMAT_R16G16_UNORM: return DRM_FORMAT_GR1616;
+    case PIPE_FORMAT_R16_FLOAT: return DRM_FORMAT_R16F;
+    case PIPE_FORMAT_R16G16_FLOAT: return DRM_FORMAT_GR1616F;
+    case PIPE_FORMAT_R32_FLOAT: return DRM_FORMAT_R32F;
+    case PIPE_FORMAT_R32G32_FLOAT: return DRM_FORMAT_GR3232F;
+    default: return 0;
+    }
+}
+
+uint32_t asb_drm_bridge_format(struct asb_drm_bridge *bridge,
+                              enum pipe_format format)
+{
+    return bridge ? asb_drm_format(bridge->capabilities, format) : 0;
+}
+
+bool asb_drm_bridge_has_modifiers(struct asb_drm_bridge *bridge)
+{
+    return bridge && (bridge->capabilities & ASB_DRM_GPU_CAP_MODIFIERS);
+}
+
+bool asb_drm_format_compatible(uint32_t format, uint32_t imported_format)
+{
+    if (!format || !imported_format)
+        return false;
+    if (format == imported_format)
+        return true;
+    switch (format) {
+    case DRM_FORMAT_ARGB8888: return imported_format == DRM_FORMAT_XRGB8888;
+    case DRM_FORMAT_XRGB8888: return imported_format == DRM_FORMAT_ARGB8888;
+    case DRM_FORMAT_ABGR8888: return imported_format == DRM_FORMAT_XBGR8888;
+    case DRM_FORMAT_XBGR8888: return imported_format == DRM_FORMAT_ABGR8888;
+    case DRM_FORMAT_ABGR2101010: return imported_format == DRM_FORMAT_XBGR2101010;
+    case DRM_FORMAT_XBGR2101010: return imported_format == DRM_FORMAT_ABGR2101010;
+    case DRM_FORMAT_ABGR16161616: return imported_format == DRM_FORMAT_XBGR16161616;
+    case DRM_FORMAT_XBGR16161616: return imported_format == DRM_FORMAT_ABGR16161616;
+    case DRM_FORMAT_ABGR16161616F: return imported_format == DRM_FORMAT_XBGR16161616F;
+    case DRM_FORMAT_XBGR16161616F: return imported_format == DRM_FORMAT_ABGR16161616F;
+    case DRM_FORMAT_ARGB1555: return imported_format == DRM_FORMAT_XRGB1555;
+    case DRM_FORMAT_XRGB1555: return imported_format == DRM_FORMAT_ARGB1555;
+    case DRM_FORMAT_ARGB4444: return imported_format == DRM_FORMAT_XRGB4444;
+    case DRM_FORMAT_XRGB4444: return imported_format == DRM_FORMAT_ARGB4444;
+    default: return false;
+    }
 }
 
 int asb_drm_open_matching_render_node(uint64_t adapter_luid, dev_t *device_id)
@@ -89,7 +172,7 @@ int asb_drm_open_matching_render_node(uint64_t adapter_luid, dev_t *device_id)
         if (fd < 0)
             continue;
         if (fstat(fd, &statbuf) == 0 && S_ISCHR(statbuf.st_mode) &&
-            asb_drm_query_adapter(fd, &found_luid) &&
+            asb_drm_query_adapter(fd, &found_luid, NULL) &&
             found_luid == adapter_luid) {
             if (device_id)
                 *device_id = statbuf.st_rdev;
@@ -102,14 +185,45 @@ int asb_drm_open_matching_render_node(uint64_t adapter_luid, dev_t *device_id)
     return found;
 }
 
+bool asb_drm_primary_node(dev_t render_device, dev_t *primary_device)
+{
+    char path[128];
+    DIR *dir;
+    struct dirent *entry;
+    bool found = false;
+
+    if (snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device/drm",
+                 major(render_device), minor(render_device)) >= sizeof(path))
+        return false;
+    dir = opendir(path);
+    if (!dir)
+        return false;
+    while (!found && (entry = readdir(dir))) {
+        char node[128];
+        struct stat statbuf;
+
+        if (strncmp(entry->d_name, "card", 4) || !entry->d_name[4] ||
+            strspn(entry->d_name + 4, "0123456789") != strlen(entry->d_name + 4) ||
+            snprintf(node, sizeof(node), "/dev/dri/%s", entry->d_name) >= sizeof(node))
+            continue;
+        if (stat(node, &statbuf) == 0 && S_ISCHR(statbuf.st_mode)) {
+            *primary_device = statbuf.st_rdev;
+            found = true;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
 struct asb_drm_bridge *asb_drm_bridge_create(int fd, uint64_t adapter_luid,
                                           int fence_fd)
 {
     struct drm_asb_gpu_native native = {0};
     struct asb_drm_bridge *bridge;
     uint64_t found_luid;
+    struct drm_asb_gpu_query query;
 
-    if (!asb_drm_query_adapter(fd, &found_luid) ||
+    if (!asb_drm_query_adapter(fd, &found_luid, &query) ||
         found_luid != adapter_luid)
         return NULL;
     bridge = calloc(1, sizeof(*bridge));
@@ -119,6 +233,9 @@ struct asb_drm_bridge *asb_drm_bridge_create(int fd, uint64_t adapter_luid,
     bridge->dxg_fd = open("/dev/dxg", O_RDWR | O_CLOEXEC);
     bridge->fence_fd = fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
     bridge->adapter_luid = adapter_luid;
+    bridge->capabilities = query.capabilities;
+    bridge->max_width = query.max_width;
+    bridge->max_height = query.max_height;
     atomic_init(&bridge->references, 1);
     native.dxg_fd = bridge->dxg_fd;
     native.fd = bridge->fence_fd;
@@ -160,6 +277,9 @@ struct asb_drm_buffer *asb_drm_buffer_create(struct asb_drm_bridge *bridge,
     struct drm_prime_handle prime = {.flags = DRM_CLOEXEC | DRM_RDWR, .fd = -1};
     struct asb_drm_buffer *buffer;
 
+    if (!image->width || image->width > bridge->max_width ||
+        !image->height || image->height > bridge->max_height)
+        return NULL;
     if (asb_drm_ioctl(bridge->fd, DRM_IOCTL_ASB_GPU_IMPORT, &imported) < 0)
         return NULL;
     prime.handle = imported.handle;
@@ -224,25 +344,45 @@ bool asb_drm_import_image(struct asb_drm_bridge *bridge, int fd,
 
 int asb_drm_export_fence(struct asb_drm_bridge *bridge, uint64_t value)
 {
+    return asb_drm_fence_sync_file(bridge, bridge->fence_fd, value);
+}
+
+int asb_drm_fence_sync_file(struct asb_drm_bridge *bridge, int fence_fd,
+                            uint64_t value)
+{
+    struct drm_asb_gpu_native native = {
+        .dxg_fd = bridge->dxg_fd,
+        .fd = fence_fd,
+    };
     struct d3dkmt_createsyncfile sync = {.fence_value = value};
 
-    sync.device.v = bridge->device_handle;
-    sync.monitored_fence.v = bridge->fence_handle;
+    if (fence_fd == bridge->fence_fd) {
+        native.device_handle = bridge->device_handle;
+        native.object_handle = bridge->fence_handle;
+        native.adapter_luid = bridge->adapter_luid;
+    } else if (fence_fd < 0 ||
+               asb_drm_ioctl(bridge->fd, DRM_IOCTL_ASB_GPU_NATIVE, &native) < 0) {
+        return -1;
+    }
+    if (native.adapter_luid != bridge->adapter_luid)
+        return -1;
+    sync.device.v = native.device_handle;
+    sync.monitored_fence.v = native.object_handle;
     if (asb_drm_ioctl(bridge->dxg_fd, LX_DXCREATESYNCFILE, &sync) < 0)
         return -1;
     return (int)sync.sync_file_handle;
 }
 
-bool asb_drm_buffer_set_fence(struct asb_drm_buffer *buffer, int fd, bool write)
+bool asb_drm_dma_buf_set_fence(int dma_buf_fd, int sync_fd, bool write)
 {
     struct dma_buf_import_sync_file sync = {
         .flags = write ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ,
-        .fd = fd,
+        .fd = sync_fd,
     };
-    return asb_drm_ioctl(buffer->fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &sync) == 0;
+    return asb_drm_ioctl(dma_buf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &sync) == 0;
 }
 
-bool asb_drm_buffer_wait(struct asb_drm_buffer *buffer, bool write)
+bool asb_drm_dma_buf_wait(int dma_buf_fd, bool write)
 {
     struct dma_buf_export_sync_file sync = {
         .flags = write ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ,
@@ -251,7 +391,7 @@ bool asb_drm_buffer_wait(struct asb_drm_buffer *buffer, bool write)
     struct timespec start, now;
     bool result = false;
 
-    if (asb_drm_ioctl(buffer->fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &sync) < 0)
+    if (asb_drm_ioctl(dma_buf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &sync) < 0)
         return false;
     struct pollfd pending = {.fd = sync.fd, .events = POLLIN};
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -269,4 +409,14 @@ bool asb_drm_buffer_wait(struct asb_drm_buffer *buffer, bool write)
     }
     close(sync.fd);
     return result;
+}
+
+bool asb_drm_buffer_set_fence(struct asb_drm_buffer *buffer, int fd, bool write)
+{
+    return asb_drm_dma_buf_set_fence(buffer->fd, fd, write);
+}
+
+bool asb_drm_buffer_wait(struct asb_drm_buffer *buffer, bool write)
+{
+    return asb_drm_dma_buf_wait(buffer->fd, write);
 }
