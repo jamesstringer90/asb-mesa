@@ -469,11 +469,17 @@ d3d12_is_format_supported(struct pipe_screen *pscreen,
        (bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET))) {
       if ((target != PIPE_TEXTURE_2D && target != PIPE_TEXTURE_RECT) ||
           sample_count > 1 || (bind & PIPE_BIND_LINEAR) ||
-          !asb_drm_bridge_format(screen->asb_bridge, format) ||
-          ((bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)) &&
-           util_format_linear(format) != PIPE_FORMAT_B8G8R8A8_UNORM &&
-           util_format_linear(format) != PIPE_FORMAT_B8G8R8X8_UNORM))
+          !asb_drm_bridge_format(screen->asb_bridge, format))
          return false;
+      if (bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)) {
+         enum pipe_format linear = util_format_linear(format);
+         bool bgra8 = linear == PIPE_FORMAT_B8G8R8A8_UNORM ||
+                      linear == PIPE_FORMAT_B8G8R8X8_UNORM;
+         bool rgb10 = linear == PIPE_FORMAT_R10G10B10A2_UNORM ||
+                      linear == PIPE_FORMAT_R10G10B10X2_UNORM;
+         if (!bgra8 && !(rgb10 && asb_drm_bridge_has_rgb10_scanout(screen->asb_bridge)))
+            return false;
+      }
    }
 #endif
 

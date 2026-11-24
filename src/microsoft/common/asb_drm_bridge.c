@@ -122,6 +122,11 @@ bool asb_drm_bridge_has_modifiers(struct asb_drm_bridge *bridge)
     return bridge && (bridge->capabilities & ASB_DRM_GPU_CAP_MODIFIERS);
 }
 
+bool asb_drm_bridge_has_rgb10_scanout(struct asb_drm_bridge *bridge)
+{
+    return bridge && (bridge->capabilities & ASB_DRM_GPU_CAP_HDR10);
+}
+
 bool asb_drm_format_compatible(uint32_t format, uint32_t imported_format)
 {
     if (!format || !imported_format)

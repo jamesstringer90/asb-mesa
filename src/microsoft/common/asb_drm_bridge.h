@@ -21,6 +21,7 @@ uint32_t asb_drm_format(uint32_t capabilities, enum pipe_format format);
 uint32_t asb_drm_bridge_format(struct asb_drm_bridge *bridge,
                               enum pipe_format format);
 bool asb_drm_bridge_has_modifiers(struct asb_drm_bridge *bridge);
+bool asb_drm_bridge_has_rgb10_scanout(struct asb_drm_bridge *bridge);
 bool asb_drm_format_compatible(uint32_t format, uint32_t imported_format);
 int asb_drm_open_matching_render_node(uint64_t adapter_luid, dev_t *device_id);
 bool asb_drm_primary_node(dev_t render_device, dev_t *primary_device);
